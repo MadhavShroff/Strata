@@ -1,107 +1,62 @@
-# Strata on NVIDIA DGX Spark (aarch64, GB10): measured results
+# Strata on NVIDIA DGX Spark (aarch64): results
 
-Branch `sparky/aarch64-port`. Measured on 2026-10-14 on one DGX Spark
-("Sparky"). These are first measurements, not a tuned benchmark.
+Qwen3.8-Flash-Next IQ2_XS (64 GiB), branch `sparky/aarch64-port`, measured 2026-10-14.
+DGX Spark: GB10, 128 GB unified memory, 20 Arm cores, CUDA 13.0.
+Every run: reasoning on (effort high), greedy, MTP drafts on, all 24576 experts resident on
+the GPU (`--expert-cache 24576 --mmap-experts`), KV int8, 70 GiB memory cap.
 
-## Machine and model
+![Context ladder](RESULTS-aarch64-context-ladder.png)
 
-| Item | Value |
-| --- | --- |
-| Machine | NVIDIA DGX Spark, GB10 Grace Blackwell, compute capability 12.1 |
-| Memory | 128 GB unified (CPU and GPU share one memory), 121.7 GB visible |
-| CPU | 20 Arm cores (10 Cortex-X925, 10 Cortex-A725); no x86 features, so CPU experts use ggml-cpu (NEON) |
-| CUDA | 13.0 |
-| Model | Qwen3.8-Flash-Next, GSQ-RCO IQ2_XS pack, two GGUF shards, 64 GiB |
-| Drafter | MTP draft layer (`--mtp`), speculative decoding on |
-| Reasoning | ON in every run, reasoning effort high (never reduced for speed) |
-| Sampling | greedy (temperature 0) |
+## Context ladder: speed, recall and GPU memory
 
-The job ran under a memory-capped systemd unit (GATE admission on Sparky).
+Each step: a filler document with 3 facts placed at 2%, 50% and 97% of its length, then one
+question for all 3. Raw rows: `RESULTS-aarch64-context-ladder.jsonl`.
 
-## Context limit
+| Context | Mode | Recall | Decode tok/s | Prompt read tok/s | GPU peak | Wall time |
+|---|---|---|---|---|---|---|
+| 18K | native | 3/3 | 38 | 660 | 38.7 GiB | 0.5 min |
+| 32K | native | 3/3 | 64 | 950 | 38.7 GiB | 0.6 min |
+| 64K | native | 3/3 | 51 | 1246 | 38.7 GiB | 0.9 min |
+| 128K | native | 3/3 | 67 | 1214 | 38.7 GiB | 1.8 min |
+| 250K | native | 3/3 | 60 | 1274 | 38.7 GiB | 3.3 min |
+| 140K | YaRN x4 | 3/3 | 50 | 728 | 40.1 GiB | 3.2 min |
+| 256K | YaRN x4 | 3/3 | 43 | 816 | 40.1 GiB | 5.3 min |
+| 512K | YaRN x4 | 3/3 | 59 | 859 | 40.1 GiB | 10.0 min |
+| 768K | YaRN x4 | 3/3 | 50 | 955 | 40.1 GiB | 13.5 min |
+| 989K | YaRN x4 | 3/3 | 45 | 834 | 40.1 GiB | 19.8 min |
 
-| Setting | Value |
-| --- | --- |
-| `--max-context` | 262144 tokens (the model's trained context) |
-| KV cache | int8, 32768 cells per layer resident on the GPU, the rest in pinned RAM |
-| Rope scaling | none (native): no `--rope-scaling` or `--yarn-*` flag was given |
+- Recall holds at 3/3 up to 989K tokens.
+- Decode stays at 43-67 tok/s with no fall-off as the context grows. Each step generated only
+  80-200 tokens, so single values are noisy.
+- At equal length, YaRN x4 decodes about 25% slower and reads prompts about 40% slower.
+- GPU memory is almost flat: the KV cache streams from RAM, and 88-92% of KV reads still hit
+  the GPU.
 
-## Decode speed, one request at a time
+Native: `--max-context 262144`. YaRN x4: `--max-context 1048576 --rope-scaling yarn
+--rope-scale 4 --yarn-orig-ctx 262144`.
 
-Prompt: a 79-token request for a technical explanation of B-tree balancing.
-Each run generates 2000 tokens. The speed is the engine's own figure from
-its `N generated in M ms (X tok/s)` line.
+## Short-prompt speed (2000 tokens generated)
 
-### Clean baseline: every expert resident on the GPU
+Native, one request: median **50.4 tok/s** decode (41.5-52.2, 3 runs), 75% draft acceptance.
 
-Profile `resident`: `--expert-cache 24576` (all 24576 expert slots,
-33.02 GiB), `--spec 4 --spec-min-p 0.5`, memory cap 70 GiB, 8 CPUs.
-One client only.
+## YaRN x4 quality on short prompts
 
-| Run | Decode tok/s | Prompt tok/s | Drafts accepted |
-| --- | --- | --- | --- |
-| r1 (cold) | 41.5 | 20.1 | 989 of 1323 (75%) |
-| r2 | 52.2 | 112.2 | 991 of 1313 (75%) |
-| r3 | 50.4 | 112.9 | 992 of 1319 (75%) |
+Six prompts (code, math, fact, reasoning, Chinese, chat), 48 greedy tokens each, YaRN x4 against
+native:
 
-Median decode: **50.4 tok/s**. Range 41.5 to 52.2.
+| Prompt | Identical tokens | Note |
+|---|---|---|
+| code, math, fact | 48/48 | identical |
+| reasoning | 47/48 | one newline differs |
+| Chinese | 9/48 | different wording, both answers correct |
+| chat | 5/48 | "a name suggestion" vs "name suggestions", same plan |
 
-### Variants (not clean)
+No answer became wrong. A per-token KL measure was not possible: this engine mode wrote no
+logits for the scored prompt.
 
-Two test scripts ran at the same time against the same server, from
-21:46 to 21:57. Each script restarted the server with its own flags, so
-some runs in this table used another script's flags or shared the GPU.
-Treat these as indications only; they need a clean repeat.
+## Limits
 
-| Variant | Flags | Runs | Decode tok/s, median (range) | Draft acceptance |
-| --- | --- | --- | --- | --- |
-| lookup3 | `--lookup-chain 3` | 3 | 45.2 (42.1-50.1) | 74% |
-| shstream | `STRATA_SH_STREAM=1` | 3 | 50.6 (41.9-52.5) | 76% |
-| spec6 | `--spec 6` | 5 | 52.0 (39.9-54.1) | 69% |
-| mtpq4 | `--mtp-q4 all` | 0 | did not reach /health in 900 s | - |
-
-No variant clearly beats the baseline.
-
-## Partial expert cache (memory cap 50 GiB)
-
-The first run used a 50 GiB cap, 3 CPUs and `--expert-cache 8446` (34.4%
-of the experts; 2.9 GiB of the cache was usable). Experts that missed the
-cache ran on the CPU through ggml-cpu (NEON).
-
-- One request, 66 output tokens, reasoning on: 20.4 s wall time. The answer
-  was correct.
-- Four parallel requests (`--batch 4`): all four answers were correct. They
-  finished in 76-86 s, about 1.5 tok/s per request and 5 tok/s in total.
-- One decode step took 584 ms, and the CPU expert work took most of it.
-
-Conclusion: on this machine, keep every expert resident on the GPU. The
-unified memory gives no benefit to a partial cache, because the CPU
-expert path is slow.
-
-## YaRN (extended context): not measured
-
-A quality test was written but not run. Its plan:
-
-- Arms: native, native again (noise floor), and YaRN
-  `--rope-scaling yarn --rope-scale 4 --yarn-orig-ctx 262144` (about 1M).
-- Method: teacher-forced comparison on the same text, KL divergence and
-  top-1 agreement per position, over six short prompts (code, math, fact,
-  reasoning, Chinese, chat), 48 new tokens each.
-
-No YaRN number exists yet. The 1M window is not taken until this test
-shows no quality loss.
-
-## Correctness
-
-Every answer that was checked was correct (37 x 43 = 1591, and 12-15 x 17
-in the parallel test). No quality benchmark was run.
-
-## Reproduce
-
-```
-strata --serve --pack <packs/iq2_xs> --native <IQ2_XS shard 1> \
-  --ple-gguf <IQ2_XS shard 2> --expert-profile data/expert-profile.bin \
-  --expert-cache 24576 --prefill auto --spec 4 --spec-min-p 0.5 \
-  --mtp <mtp/rt> --max-context 262144 --kv int8 --kv-resident 32768 \
-  --mmap-experts
-```
+- One machine, one pack, one run per context step.
+- The needle test checks retrieval only, not long-context reasoning.
+- A 50 GiB cap with a partial expert cache ran at about 5 tok/s total: on this machine, keep
+  every expert on the GPU.
