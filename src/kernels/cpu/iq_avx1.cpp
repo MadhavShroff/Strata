@@ -32,11 +32,16 @@
 #include <cstdlib>
 #include <cstring>
 
+// STRATA_X86_COMPAT (the aarch64 port): there is no __AVX__ / __FMA__ / __F16C__ on a non-x86
+// target.  SIMDe maps every intrinsic in this file to NEON, so the ISA guards do not apply.  The
+// no-FMA requirement is a ROUNDING contract, and SIMDe never contracts a multiply-add here.
+#if !defined(STRATA_X86_COMPAT)
 #if !defined(__AVX__)
 #error "iq_avx1.cpp must be compiled with AVX enabled (see the per-source flags in CMakeLists.txt)"
 #endif
 #if defined(__FMA__) || defined(__F16C__)
 #error "iq_avx1.cpp must be compiled without FMA/F16C: it runs on CPUs (Sandy/Ivy Bridge) that lack them"
+#endif
 #endif
 
 namespace strata::kernels::cpu {
@@ -485,11 +490,15 @@ void q8k_quant_avx1(const float* x, void* vy, int64_t k) {
             __m128i v[4];
             for (int q = 0; q < 4; ++q) {
                 __m128 p = _mm_mul_ps(vis, _mm_loadu_ps(x + j + 4 * q));
-#if defined(__GNUC__) && !defined(__clang__)
+#if defined(__GNUC__) && !defined(__clang__) && !defined(STRATA_X86_COMPAT)
                 // GCC fuses a multiply and an add into an FMA by default (-ffp-contract=fast); the reference
                 // rounds the product before the add, so the product must stay a separate value (no FMA under
                 // -mavx, but the barrier keeps the contract if the file is ever built with a newer floor)
                 __asm__("" : "+x"(p));
+#elif defined(__GNUC__) && !defined(__clang__)
+                // STRATA_X86_COMPAT (the aarch64 port): "x" names an x86 SSE register; a memory barrier on the
+                // same value stops the same contraction on any target.
+                __asm__("" : "+m"(p));
 #endif
                 const __m128 t = _mm_add_ps(p, magic);
                 v[q] = _mm_min_epi32(_mm_sub_epi32(_mm_and_si128(_mm_castps_si128(t), mant), off), c127);

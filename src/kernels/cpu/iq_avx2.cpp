@@ -427,10 +427,15 @@ void q8k_quant_avx2(const float* x, void* vy, int64_t k) {
             __m256i v[4];
             for (int q = 0; q < 4; ++q) {
                 __m256 p = _mm256_mul_ps(vis, _mm256_loadu_ps(x + j + 8 * q));
-#if defined(__GNUC__) && !defined(__clang__)
+#if defined(__GNUC__) && !defined(__clang__) && !defined(STRATA_X86_COMPAT)
                 // GCC fuses a multiply and an add into an FMA by default (-ffp-contract=fast); the reference rounds
                 // the product before the add, so the product must stay a separate value
                 __asm__("" : "+x"(p));
+#elif defined(__GNUC__) && !defined(__clang__)
+                // STRATA_X86_COMPAT (the aarch64 port): "x" names an x86 SSE register, and SIMDe's __m256 is a
+                // pair of NEON vectors that no single register holds.  A memory barrier on the same value stops
+                // the same contraction on any target.
+                __asm__("" : "+m"(p));
 #endif
                 const __m256 t = _mm256_add_ps(p, magic);
                 v[q] = _mm256_min_epi32(_mm256_sub_epi32(_mm256_and_si256(_mm256_castps_si256(t), mant), off), c127);

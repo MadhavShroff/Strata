@@ -13,7 +13,9 @@
 
 #include <cstring>
 
-#if !defined(__AVX__)
+// STRATA_X86_COMPAT (the aarch64 port): no __AVX__ on a non-x86 target; SIMDe maps the
+// intrinsics in this file to NEON.
+#if !defined(__AVX__) && !defined(STRATA_X86_COMPAT)
 #error "kq_avx1.cpp must be compiled with AVX enabled (see the per-source flags in CMakeLists.txt)"
 #endif
 

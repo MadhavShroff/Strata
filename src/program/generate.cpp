@@ -2768,6 +2768,9 @@ int main(int argc, char** argv) {
     strata::metal_engine::set_model_shard(o.native_preset.c_str());   // the decode window reads the model GGUF itself
     o.mmap_experts = true;   // ... experts included: no resident copy of them (the GGUF shards in place)
     if (false) {
+#elif defined(STRATA_X86_COMPAT)   // aarch64 + CUDA (DGX Spark): the CPUID stub reports no x86 feature, so every
+    // CPU expert row takes ggml-cpu, which this build compiles natively (NEON).  No x86 kernel runs; nothing to refuse.
+    if (false) {
 #else
     if (!strata::kernels::cpu::cpu_avx2_ok() && isa_floor[0] == '\0') {
 #endif

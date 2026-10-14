@@ -28,6 +28,58 @@ if(MSVC AND CMAKE_BUILD_TYPE STREQUAL "Release")
   add_link_options(/DEBUG /OPT:REF /OPT:ICF)
 endif()
 
+# ---- aarch64 port (NVIDIA DGX Spark / GB10, and any ARM64 Linux with CUDA) ----
+#
+# Every CPU kernel in this engine is written in x86 SSE / AVX2 / AVX-512 intrinsics and every
+# source that spins or fences includes <immintrin.h>.  On AArch64 that header does not exist, so
+# the build stopped at the first file.  STRATA_X86_COMPAT puts compat/ first on the include path:
+#   compat/immintrin.h        -> SIMDe's x86 headers, which map the intrinsics to NEON
+#   compat/cpuid.h            -> a CPUID stub that reports no x86 feature (so cpu_avx512_ok() and
+#                                cpu_avx2_ok() answer false and the dispatch takes ggml-cpu's rows)
+#   compat/strata_x86_compat.h -> _mm_pause / _mm_sfence and the three AVX-512 horizontal
+#                                reductions SIMDe 0.8.2 does not carry
+# The per-file -mavx2 / -mavx512f flags below are dropped on a non-x86 target: the compiler has no
+# such option and SIMDe needs none.  NEON is the ISA baseline of every AArch64 target.
+if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64|x64|X86|i[3-6]86")
+  set(STRATA_X86_COMPAT ON CACHE BOOL "translate the x86 CPU intrinsics to this ISA through SIMDe" FORCE)
+else()
+  set(STRATA_X86_COMPAT OFF CACHE BOOL "translate the x86 CPU intrinsics to this ISA through SIMDe")
+endif()
+set(STRATA_SIMDE_DIR "" CACHE PATH "SIMDe checkout (its parent of simde/x86/avx512.h); empty: fetch v0.8.2")
+if(STRATA_X86_COMPAT)
+  if(STRATA_SIMDE_DIR)
+    set(_strata_simde "${STRATA_SIMDE_DIR}")
+  else()
+    include(FetchContent)
+    FetchContent_Declare(strata_simde
+      URL https://github.com/simd-everywhere/simde/archive/refs/tags/v0.8.2.tar.gz
+      URL_HASH SHA256=ed2a3268658f2f2a9b5367628a85ccd4cf9516460ed8604eed369653d49b25fb
+      DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+    FetchContent_GetProperties(strata_simde)
+    if(NOT strata_simde_POPULATED)
+      FetchContent_Populate(strata_simde)
+    endif()
+    set(_strata_simde "${strata_simde_SOURCE_DIR}")
+  endif()
+  if(NOT EXISTS "${_strata_simde}/simde/x86/avx512.h")
+    message(FATAL_ERROR "STRATA_X86_COMPAT needs SIMDe: ${_strata_simde}/simde/x86/avx512.h is missing "
+                        "(point -DSTRATA_SIMDE_DIR at a SIMDe checkout)")
+  endif()
+  # compat/ FIRST so compat/immintrin.h and compat/cpuid.h win over any system header of that name.
+  include_directories(BEFORE ${CMAKE_CURRENT_SOURCE_DIR}/compat ${_strata_simde})
+  add_compile_definitions(STRATA_X86_COMPAT=1 SIMDE_ENABLE_NATIVE_ALIASES=1)
+  message(STATUS "Strata: x86 intrinsics translated to ${CMAKE_SYSTEM_PROCESSOR} through SIMDe (${_strata_simde})")
+endif()
+# The per-file x86 ISA flags are meaningless to a non-x86 compiler: swallow them in one place so the
+# kernel-by-kernel property calls below stay as upstream wrote them.
+function(strata_x86_source_flags)
+  if(STRATA_X86_COMPAT)
+    return()
+  endif()
+  cmake_parse_arguments(_sx "" "FLAGS" "SOURCES" ${ARGN})
+  set_source_files_properties(${_sx_SOURCES} PROPERTIES COMPILE_OPTIONS "${_sx_FLAGS}")
+endfunction()
+
 # The prebuilt release (setup.py downloads it, so users need no compiler): ggml's CPU backend for any AVX2 CPU
 # instead of this machine's (Strata's own AVX-512 kernels are per-file and chosen at run time either way), and
 # the MSVC runtime linked in, so no Visual C++ redistributable is needed.
@@ -1215,7 +1267,9 @@ add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu
 target_include_directories(strata_kernels_cpu PUBLIC include)
 # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).
-if(MSVC)
+if(STRATA_X86_COMPAT)
+  # non-x86: SIMDe needs no ISA option, and the compiler has none of these to give.
+elseif(MSVC)
   set_source_files_properties(src/kernels/cpu/expert.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
   set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
 else()
@@ -1229,7 +1283,9 @@ endif()
 # target("avxvnni") - never -mavxvnni on a file, which would let the compiler use it anywhere - and MSVC takes the
 # intrinsics under /arch:AVX2.  A compiler without them (GCC < 11, Clang < 12) builds the files without the copies.
 include(CheckCXXSourceCompiles)
-if(MSVC)
+if(STRATA_X86_COMPAT)
+  set(CMAKE_REQUIRED_FLAGS "")
+elseif(MSVC)
   set(CMAKE_REQUIRED_FLAGS "/arch:AVX2")
 else()
   set(CMAKE_REQUIRED_FLAGS "-mavx2 -mfma -mf16c")
@@ -1321,7 +1377,9 @@ if(STRATA_NATIVE_EXPERTS)
                                            src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/q2_avx1.cpp src/kernels/cpu/iq_avx1.cpp
                                            src/kernels/cpu/nvfp4_avx512.cpp src/kernels/cpu/nvfp4_avx2.cpp)
   target_include_directories(strata_kernels_cpu PRIVATE third_party/ggml)
-  if(MSVC)
+  if(STRATA_X86_COMPAT)
+    # non-x86: SIMDe needs no ISA option (see STRATA_X86_COMPAT at the top of this file).
+  elseif(MSVC)
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/nvfp4_avx512.cpp
                                 PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
