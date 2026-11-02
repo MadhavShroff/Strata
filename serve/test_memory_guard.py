@@ -181,6 +181,37 @@ class AvailableHostBytes(unittest.TestCase):
     def test_unreadable_memavailable_is_none(self):
         self.assertIsNone(self.read({}))
 
+    def test_clean_inactive_file_cache_is_credited(self):
+        # E1 2026-11-02: a group at 69 of 80 GiB, 12 GiB of it clean inactive cache, held a one-word request 20 min.
+        n = self.read({
+            "/proc/meminfo": b"MemAvailable: 104857600 kB\n",
+            "/proc/self/cgroup": b"0::/strata\n",
+            "/sys/fs/cgroup/strata/memory.max": str(80 * GIB).encode(),
+            "/sys/fs/cgroup/strata/memory.current": str(69 * GIB).encode(),
+            "/sys/fs/cgroup/strata/memory.stat": (
+                f"anon 1\ninactive_file {12 * GIB}\nactive_file {GIB}\nfile_dirty {GIB}\nfile_writeback 0\n").encode(),
+        })
+        self.assertEqual(n, (80 - 69 + 12 - 1) * GIB)            # room + inactive file - dirty; active not credited
+
+    def test_the_credit_never_exceeds_usage(self):
+        n = self.read({
+            "/proc/meminfo": b"MemAvailable: 104857600 kB\n",
+            "/proc/self/cgroup": b"0::/strata\n",
+            "/sys/fs/cgroup/strata/memory.max": str(10 * GIB).encode(),
+            "/sys/fs/cgroup/strata/memory.current": str(2 * GIB).encode(),
+            "/sys/fs/cgroup/strata/memory.stat": f"inactive_file {50 * GIB}\n".encode(),
+        })
+        self.assertEqual(n, 10 * GIB)                            # credit clamps to the 2 GiB charged
+
+    def test_a_missing_memory_stat_gives_no_credit(self):
+        n = self.read({
+            "/proc/meminfo": b"MemAvailable: 104857600 kB\n",
+            "/proc/self/cgroup": b"0::/strata\n",
+            "/sys/fs/cgroup/strata/memory.max": str(10 * GIB).encode(),
+            "/sys/fs/cgroup/strata/memory.current": str(6 * GIB).encode(),
+        })
+        self.assertEqual(n, 4 * GIB)
+
     def test_cgroup_v1_limit_wins_too(self):
         n = self.read({
             "/proc/meminfo": b"MemAvailable: 4194304 kB\n",

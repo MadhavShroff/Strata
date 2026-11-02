@@ -743,12 +743,35 @@ FATAL_PREFIXES = ("ERR verify: timed out at layer ", "ERR verify batch: timed ou
 KV_HOST_BYTES_PER_CELL = 12672
 
 
+def _reclaimable_cache(base: str, current: int, v1: bool) -> int:
+    """Clean inactive file cache of one cgroup (memory.stat: v2 inactive_file, v1 total_inactive_file), less its
+    dirty and writeback pages, never more than the group's usage. A memory.stat that is missing or unparsable
+    gives no credit."""
+    keys = ("total_inactive_file", "total_dirty", "total_writeback") if v1 else (
+        "inactive_file", "file_dirty", "file_writeback")
+    found = {}
+    try:
+        with open(f"{base}/memory.stat", "rb") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) == 2 and parts[0].decode("ascii", "replace") in keys:
+                    found[parts[0].decode("ascii")] = int(parts[1])
+    except (OSError, ValueError):
+        return 0
+    if keys[0] not in found:
+        return 0
+    credit = min(found[keys[0]], current)
+    return max(0, credit - found.get(keys[1], 0) - found.get(keys[2], 0))
+
+
 def available_host_bytes() -> int | None:
     """MemAvailable from /proc/meminfo, made no more generous by the cgroup the server sits in: the tightest of
     MemAvailable and (memory.max - memory.current) over the cgroup levels of this process (v2 walk from the root
-    to the job's own group; v1's single memory group). None when MemAvailable itself cannot be read. Unlike the
-    engine's parking guard (conversation_memory.cpp) this credits no reclaimable file cache: admission is
-    decided on the pessimistic side."""
+    to the job's own group; v1's single memory group). None when MemAvailable itself cannot be read. A group's
+    charged usage counts its page cache, which the kernel gives back on demand, so each level credits its clean
+    inactive file cache the way the engine's parking guard (conversation_memory.cpp) does: without that credit a
+    group full of model-file cache looks full, and the guard held a one-word request for 20 minutes (E1,
+    2026-11-02). Active file and shmem are not credited."""
     try:
         with open("/proc/meminfo", "rb") as f:
             for line in f:
@@ -770,6 +793,7 @@ def available_host_bytes() -> int | None:
                     cgroup = ("/sys/fs/cgroup/memory" + parts[2], "memory.limit_in_bytes", "memory.usage_in_bytes")
     except OSError:
         cgroup = None
+    v1 = cgroup is not None and cgroup[1] == "memory.limit_in_bytes"
     while cgroup is not None:
         base, limit_name, current_name = cgroup
         cgroup = None if base in ("/sys/fs/cgroup", "/sys/fs/cgroup/memory") else (
@@ -780,7 +804,7 @@ def available_host_bytes() -> int | None:
             if raw != b"max":
                 with open(f"{base}/{current_name}", "rb") as f:
                     current = int(f.read().split()[0])
-                available = min(available, max(0, int(raw) - current))
+                available = min(available, max(0, int(raw) - current + _reclaimable_cache(base, current, v1)))
         except (OSError, ValueError, IndexError):
             pass
     return available
