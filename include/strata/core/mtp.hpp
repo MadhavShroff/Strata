@@ -26,6 +26,7 @@
 
 #include <cuda_runtime.h>
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -99,6 +100,21 @@ public:
     /// accepted row) for T-1 drafts at cells p+a+1 ...  `drafts` gets T-1 tokens.
     bool draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
+
+    /// draft() in two halves, so a caller can overlap SEVERAL drafters (the batch slots), each on its own stream:
+    /// draft_launch stages the inputs and launches the graphs on the drafter's stream WITHOUT waiting for them;
+    /// draft_collect does the waits, the h_out_/h_prob_ reads and the PLE prefetches, and fills `drafts` (and
+    /// `probs`, `n_drafts`) exactly as draft() would - the same graphs, the same inputs, the same per-slot state.
+    /// Chained drafts (min_p <= 0): every graph is launched before draft_launch returns, so collect only waits.
+    /// Stepped drafts (min_p > 0): each step needs the previous draft ON THE HOST before it can launch (the
+    /// min_p early stop), so draft_launch queues only the round graph and draft_collect runs the steps serially,
+    /// exactly as draft() always did - that path does not overlap its steps, by design.
+    /// One round may be in flight: a second draft_launch before draft_collect fails, and draft_collect without a
+    /// live launch is a no-op that returns true.  draft() = draft_launch + draft_collect, unchanged for every
+    /// other caller.
+    bool draft_launch(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
+                      float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
+    bool draft_collect(std::string& err);
 
     /// The first round: one cell (`cell`) from `R_row` (device) and `token` -> T-1 drafts.
     bool draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
@@ -218,6 +234,24 @@ private:
     std::vector<float> lg_host_;
     // --pipeline-windows 2 (chain_launch)
     bool stage_source_R(int T, std::string& err);   ///< set_source_R's rows into the bound buffer
+    // draft_launch/draft_collect: the round's PLE n-gram prefetch, from the in-flight state (flight_)
+    void draft_prefetch_ple(int32_t tok);
+    /// draft_launch/draft_collect: the one round that may sit between them.  draft() itself never leaves one
+    /// behind: it collects in the same call.  `chained` is the min_p <= 0 round, whose every graph is launched
+    /// up front; a stepped round (min_p > 0) has only its round graph in flight and its steps still to launch.
+    struct DraftFlight {
+        bool live = false, chained = false, cp = false;
+        int max_steps = 0, n = 0;
+        int32_t* drafts = nullptr;
+        float* probs = nullptr;
+        int* n_drafts = nullptr;
+        float min_p = 0.0f;
+        bool do_ple = false;
+        SessionState* pss = nullptr;
+        int32_t ple_prev[2] = {0, 0};
+        std::chrono::steady_clock::time_point t0{};
+    };
+    DraftFlight flight_;
     bool force_on_ = false, chain_live_ = false;
     const float* src_R_ = nullptr;
     int32_t *h_force_ = nullptr, *m_force_ = nullptr;   ///< the forced tokens (mapped), -1 = the step's own pick

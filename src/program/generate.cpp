@@ -10056,6 +10056,16 @@ int main(int argc, char** argv) {
                 bt_rows += keep[active[a]];
                 bt_accepted += keep[active[a]] - 1;
             }
+            // Launch every active slot's draft first, then collect them in slot order: each slot drafter has its
+            // own stream, graphs and state, so the rounds overlap instead of one host wait per slot (nsys p6:
+            // the slot drafters ran serially, ~7 % of the GPU together).  The drafts stay bitwise what draft()
+            // gave: the same graphs, the same inputs, only the host waits move after every launch.
+            // STRATA_BATCH_DRAFT_OVERLAP=0 restores the serial launch-and-wait per slot.
+            static const bool batch_draft_overlap = [] {
+                const char* e = std::getenv("STRATA_BATCH_DRAFT_OVERLAP");
+                return e == nullptr || e[0] != '0';
+            }();
+            std::vector<int> mtp_launched;
             for (int t = 0; t < A; ++t) {
                 const int b = active[t];
                 BSlot& sl = bs[(size_t) b];
@@ -10101,14 +10111,23 @@ int main(int argc, char** argv) {
                                         ver.final_R_all() + (size_t) first[t] * stride,
                                         2 * stride * sizeof(float), cudaMemcpyDeviceToDevice,
                                         slot_mtp[(size_t) b]->stream()) != cudaSuccess ||
-                        !slot_mtp[(size_t) b]->draft(2, outb + first[t], pos[first[t]], keep[b] - 1,
-                                                    sl.draft.data(), err)) {
+                        !(batch_draft_overlap
+                              ? slot_mtp[(size_t) b]->draft_launch(2, outb + first[t], pos[first[t]], keep[b] - 1,
+                                                                   sl.draft.data(), err)
+                              : slot_mtp[(size_t) b]->draft(2, outb + first[t], pos[first[t]], keep[b] - 1,
+                                                            sl.draft.data(), err))) {
                         std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str());
                         return false;
                     }
                     sl.draft_ready = true;
+                    mtp_launched.push_back(b);   // collected below, in slot order (a no-op when the serial draft ran)
                 }
             }
+            for (const int bl : mtp_launched)
+                if (!slot_mtp[(size_t) bl]->draft_collect(err)) {
+                    std::printf("ERR batch MTP slot %d: %s\n", bl, err.c_str());
+                    return false;
+                }
             std::fflush(stdout);
             bt_emit += msd(w2, Clock::now());
             if (adapt_run.th.joinable()) {
