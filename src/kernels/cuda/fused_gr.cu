@@ -2216,8 +2216,8 @@ int g_gr_fast = -1;
 #endif
 void fused_gr_set_fast(int on) { g_gr_fast = on; }
 
-bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
-                         int stamp_i0) {
+static bool fused_gr_read_multi_chunk(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
+                                      unsigned long long* stamp_buf, int stamp_i0) {
     if (n_tok < 1 || n_tok > kFusedGrMaxT || xn_scratch == nullptr) {
         std::fprintf(stderr, "fused_gr_read_multi: invalid arguments\n");
         std::exit(1);
@@ -2349,6 +2349,26 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         std::exit(1);
     }
     return q8;
+}
+
+/// A window of more than kFusedGrMaxT tokens (kVerifyMaxT is 12) runs as groups of at most kFusedGrMaxT: every token
+/// keeps its own accumulators and arguments in these kernels, so each token's outputs are the same bits whatever
+/// group it sits in.  The profile stamps and the answer come from the groups: stamps from the first, the q8_1 images
+/// written only when every group wrote them (a caller that sees false quantizes all tokens itself).
+bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
+                         int stamp_i0) {
+    if (n_tok <= kFusedGrMaxT) return fused_gr_read_multi_chunk(a, n_tok, xn_scratch, stream, stamp_buf, stamp_i0);
+    if (xn_scratch == nullptr) {
+        std::fprintf(stderr, "fused_gr_read_multi: invalid arguments\n");
+        std::exit(1);
+    }
+    bool wrote = true;
+    for (int c0 = 0; c0 < n_tok; c0 += kFusedGrMaxT) {
+        const int n = n_tok - c0 < kFusedGrMaxT ? n_tok - c0 : kFusedGrMaxT;
+        wrote = fused_gr_read_multi_chunk(a + c0, n, xn_scratch + (size_t) c0 * HC * N, stream,
+                                          c0 == 0 ? stamp_buf : nullptr, stamp_i0) && wrote;
+    }
+    return wrote;
 }
 
 // STRATA_HC_Q8 on a bf16 pack: one warp a Q8_0 block, ggml's reference rounding (d = amax / 127 as fp16, q = round(x * (1 / d)))

@@ -20,7 +20,9 @@
 //   6. `gr_write`'s `2*sigmoid`, which centres the gate on 1 so a ZERO injection is a plain residual add.
 //      Asserted as a property, not as a value, because that is what the source comment claims.
 #include "strata/kernels/gr.hpp"
+#include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/fused_gr.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
 #include <cuda_runtime.h>
@@ -275,10 +277,56 @@ int scalar_activation_contract() {
     return bad;
 }
 
-int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const uint16_t* d_up,
-                           const uint16_t* d_inject, float eps) {
+// bf16_gemv_fp32_mmvf_multi with 1..kVerifyMaxT rows (more than 8 run as groups of 8) against one single-row call
+// per row: every output the same bits.  The shapes are the hyper-connection's (hc*n_embd -> hc_lr, hc_lr -> hc*n_embd).
+int mmvf_multi_rows_parity() {
     using namespace strata::kernels;
-    constexpr int N = 2560, HC = 4, LR = 320, D = N * HC, T = kFusedGrMaxT;
+    int bad = 0;
+    const int shapes[2][2] = {{10240, 320}, {320, 10240}};
+    std::mt19937 rng(0x51ab);
+    std::normal_distribution<float> normal(0.0f, 0.5f);
+    for (const auto& sh : shapes) {
+        const int n_in = sh[0], n_out = sh[1], R = kVerifyMaxT;
+        std::vector<float> x((size_t) R * n_in);
+        std::vector<uint16_t> w((size_t) n_out * n_in);
+        for (auto& v : x) v = normal(rng);
+        for (auto& v : w) { float f = normal(rng); uint32_t b; std::memcpy(&b, &f, 4); v = (uint16_t) (b >> 16); }
+        float *dx = nullptr, *dy = nullptr, *dr = nullptr;
+        uint16_t* dw = nullptr;
+        check(cudaMalloc(&dx, x.size() * sizeof(float)), "mmvf x");
+        check(cudaMalloc(&dw, w.size() * sizeof(uint16_t)), "mmvf w");
+        check(cudaMalloc(&dy, (size_t) R * n_out * sizeof(float)), "mmvf y");
+        check(cudaMalloc(&dr, (size_t) R * n_out * sizeof(float)), "mmvf ref");
+        check(cudaMemcpy(dx, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice), "mmvf copy x");
+        check(cudaMemcpy(dw, w.data(), w.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "mmvf copy w");
+        for (int r = 0; r < R; ++r)
+            bf16_gemv_fp32_mmvf(dx + (size_t) r * n_in, dw, dr + (size_t) r * n_out, n_in, n_out, nullptr);
+        check(cudaDeviceSynchronize(), "mmvf ref sync");
+        std::vector<float> ref((size_t) R * n_out), got((size_t) R * n_out);
+        check(cudaMemcpy(ref.data(), dr, ref.size() * sizeof(float), cudaMemcpyDeviceToHost), "mmvf ref read");
+        for (int rows = 1; rows <= R; ++rows) {
+            check(cudaMemset(dy, 0xff, (size_t) R * n_out * sizeof(float)), "mmvf poison");
+            bf16_gemv_fp32_mmvf_multi(dx, n_in, dw, dy, n_out, n_in, n_out, rows, nullptr);
+            check(cudaDeviceSynchronize(), "mmvf sync");
+            check(cudaMemcpy(got.data(), dy, got.size() * sizeof(float), cudaMemcpyDeviceToHost), "mmvf read");
+            if (std::memcmp(got.data(), ref.data(), (size_t) rows * n_out * sizeof(float)) != 0) {
+                std::printf("  mmvf multi %d rows (%d -> %d) differs from single-row calls\n", rows, n_in, n_out);
+                ++bad;
+            }
+        }
+        cudaFree(dx); cudaFree(dw); cudaFree(dy); cudaFree(dr);
+    }
+    std::printf("  bf16 mmvf multi, 1..%d rows against single-row calls, bit for bit: %s\n", kVerifyMaxT,
+                bad ? "FAIL" : "pass");
+    return bad;
+}
+
+// T tokens in one fused_gr_read_multi call: kFusedGrMaxT is one launch, kVerifyMaxT (12) runs as two groups of the
+// entry point; both must equal T single-token calls to the bit.
+int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const uint16_t* d_up,
+                           const uint16_t* d_inject, float eps, int T) {
+    using namespace strata::kernels;
+    constexpr int N = 2560, HC = 4, LR = 320, D = N * HC;
     std::mt19937 rng(0x6f8a);
     std::normal_distribution<float> normal(0.0f, 0.3f);
     std::vector<float> r((size_t) T * D), bo((size_t) T * N), inj((size_t) T * HC);
@@ -456,11 +504,11 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
                 }
             }
         }
-        std::printf("  fused GR read + q8_1 (STRATA_QFUSE), T 1..8, direct and graph replays: %s\n", qbad ? "FAIL" : "pass");
+        std::printf("  fused GR read + q8_1 (STRATA_QFUSE), T 1..%d, direct and graph replays: %s\n", T, qbad ? "FAIL" : "pass");
         bad += qbad;
         cudaFree(d_q); cudaFree(d_ref); cudaFree(d_cnt);
     }
-    std::printf("  fused GR multi max-T=8 LDS launch and changing graph replay %s\n",
+    std::printf("  fused GR multi T=%d LDS launch and changing graph replay %s\n", T,
                 bad == 0 ? "pass" : "FAIL");
     check(cudaGraphExecDestroy(graph_exec), "multi graph exec destroy");
     check(cudaGraphDestroy(graph), "multi graph destroy");
@@ -811,7 +859,9 @@ int main(int argc, char** argv) {
                         activation_mode_name(mode), ok ? "pass" : "*** FAIL ***", rm, ri);
             if (!ok) ++bad;
         }
-        bad += fused_multi_lds_parity(dN, dD, dU, dJ, eps);
+        bad += fused_multi_lds_parity(dN, dD, dU, dJ, eps, strata::kernels::kFusedGrMaxT);
+        bad += fused_multi_lds_parity(dN, dD, dU, dJ, eps, strata::kernels::kVerifyMaxT);
+        bad += mmvf_multi_rows_parity();
         select_activation_mode(0);
         cudaFree(rws_raw);
         cudaFree(dR); cudaFree(dN); cudaFree(dD); cudaFree(dU); cudaFree(dJ); cudaFree(dM); cudaFree(dI);
