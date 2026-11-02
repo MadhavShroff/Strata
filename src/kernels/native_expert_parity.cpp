@@ -325,6 +325,19 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             const bool same = std::memcmp(old_g.data(), got_g.data(), got_g.size() * 4) == 0;
             std::printf("          gpu decode-once vs per-entry kernels: %s\n", same ? "bitwise equal" : "MISMATCH");
             if (!same) ++failures;
+            // the shared-staged NVFP4 weight loads (STRATA_EXPERT_LOADS) against the direct ones: the same
+            // values, so the outputs are bitwise equal (the pair takes the direct path for other types)
+            if (f.gu_type == 40 || f.d_type == 40) {
+                const bool loads_was = strata::kernels::iq_expert_loads();
+                strata::kernels::iq_set_expert_loads(!loads_was);
+                strata::kernels::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, 1, NT, dxq, dscr, dout, s);
+                strata::kernels::iq_set_expert_loads(loads_was);
+                cudaStreamSynchronize(s);
+                cudaMemcpy(old_g.data(), dout, old_g.size() * 4, cudaMemcpyDeviceToHost);
+                const bool same_l = std::memcmp(old_g.data(), got_g.data(), got_g.size() * 4) == 0;
+                std::printf("          gpu expert loads staged vs direct: %s\n", same_l ? "bitwise equal" : "MISMATCH");
+                if (!same_l) ++failures;
+            }
         }
         {   // (d) the GPU dequantizers (prompt path: iq_dequant_f32/_f16; embedding: iq_embed_rows) against to_float
             float* dq = nullptr;

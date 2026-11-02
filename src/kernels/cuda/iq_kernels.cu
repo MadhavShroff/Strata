@@ -17,6 +17,7 @@
 #define GGML_COMMON_IMPL_CUDA
 #include "ggml-common.h"
 
+#include <cstddef>
 #include <cstdio>
 #include <utility>
 #include <cstdlib>
@@ -1236,6 +1237,120 @@ __device__ __forceinline__ void row_dot_80_sub16(const uint8_t* row, const block
     }
 }
 
+// ---------------------------------------------------------- NVFP4 rows staged through shared memory
+// STRATA_EXPERT_LOADS=0 keeps the NVFP4 grouped experts' direct weight loads (the shared-staged path below
+// is the default; bitwise equal, kept for A/B timing and as the fallback)
+bool g_stage_loads = [] {
+    const char* v = std::getenv("STRATA_EXPERT_LOADS");
+    return v == nullptr || v[0] == '\0' || v[0] != '0';
+}();
+// STRATA_EXPERT_LOADS (2026-11-02, the 6-slot profile: native_gu_multi_kernel 26.6 % of GPU time,
+// native_down_multi_kernel 14.9 %, both under the GB10 read ceiling).  The direct path reads each 36-byte
+// NVFP4 block through four 4-byte code loads and two 1-byte scale loads; at 16 lanes per row one such
+// instruction scatters over 18 sectors of two rows and the L1 pays a wavefront per sector touched.  Here the
+// block first copies its rows' bytes into shared memory with aligned vector loads - one coalesced sweep, the
+// same bytes - and every lane then reads its half-block's four code words and two scale bytes from shared as
+// 16-bit loads (every one of those offsets is even; nvfp4_w_sm40 takes them from block_nvfp4's fields).
+// The words and scales are the same values the direct loads return, so W is bit for bit Split<40>::load's W
+// and every dot keeps its dp4a chain, its FP32 multiply order and its reduction tree.  STRATA_EXPERT_LOADS=0
+// keeps the direct loads everywhere (the A/B control arm).
+// Half-block k of a staged row is Split<40>::load(row, k >> 1, 4 * (k & 1)): block k >> 1, its sub-blocks 2h and
+// 2h + 1 (h = k & 1).  block_nvfp4 is d[4] then qs[32], so the four code words are qs bytes 16h .. 16h + 15 and
+// the scale pair is d[2h], d[2h + 1].  Both offsets come from the struct and every one is even (16-bit loads).
+static_assert(sizeof(block_nvfp4) == 36 && offsetof(block_nvfp4, d) % 2 == 0 && offsetof(block_nvfp4, qs) % 2 == 0,
+              "the staged NVFP4 reader assumes 36-byte blocks with even field offsets");
+__device__ __forceinline__ typename Split<40>::W nvfp4_w_sm40(const uint8_t* __restrict__ s_row, int k) {
+    const int h = k & 1;
+    const uint8_t* blk = s_row + sizeof(block_nvfp4) * (size_t) (k >> 1);
+    const uint16_t* q16 = reinterpret_cast<const uint16_t*>(blk + offsetof(block_nvfp4, qs) + 16 * h);
+    int w[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) w[j] = (int) q16[2 * j] | ((int) q16[2 * j + 1] << 16);
+    typename Split<40>::W r;
+    r.v0[0] = get_int_from_table_16(w[0], kvalues_fp4);
+    r.v1[0] = get_int_from_table_16(w[1], kvalues_fp4);
+    r.v0[1] = get_int_from_table_16(w[2], kvalues_fp4);
+    r.v1[1] = get_int_from_table_16(w[3], kvalues_fp4);
+    const unsigned sp = *reinterpret_cast<const uint16_t*>(blk + offsetof(block_nvfp4, d) + 2 * h);
+    r.sc[0] = ue4m3_to_f32_half((uint8_t) (sp & 0xFF));
+    r.sc[1] = ue4m3_to_f32_half((uint8_t) (sp >> 8));
+    return r;
+}
+
+// row_dot_80_sub16<TY = 40> over a shared-staged row: the same k sets per lane (s: k = t, t+32, t+64; s16:
+// k = t+16, t+48), the same per-accumulator order, the same fadd(s, s16) and the same 8..1 butterfly.
+template<int NC, bool EXACT_N = false>
+__device__ __forceinline__ void row_dot_80_sub16_sm40(const uint8_t* s_row, const block_q8_1* __restrict__ x,
+                                                      const int (&off)[NC], int n, int t, float (&s)[NC]) {
+#pragma unroll
+    for (int c = 0; c < NC; ++c) s[c] = 0.0f;
+    float s16[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) s16[c] = 0.0f;
+#pragma unroll
+    for (int m = 0; m < 5; ++m) {
+        const int k = t + 16 * m;
+        const typename Split<40>::W w = nvfp4_w_sm40(s_row, k);
+        const int kbx = k >> 1, iqs = 4 * (k & 1);
+        float* acc = (m & 1) ? s16 : s;
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (EXACT_N || c < n) acc[c] += Split<40>::apply(w, x + off[c] + kbx * 2, iqs);
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        if (EXACT_N || c < n) {
+            s[c] = __fadd_rn(s[c], s16[c]);
+#pragma unroll
+            for (int o = 8; o > 0; o >>= 1) s[c] += __shfl_xor_sync(0xffffffffu, s[c], o);
+        }
+    }
+}
+
+// row_dot_20_sub8<TD = 40> over a shared-staged row: s takes k = t, s16 takes k = t+16 (lanes 0-3), s8 takes
+// k = t+8, then the same __fadd_rn(__fadd_rn(s, s16), __fadd_rn(s8, 0)) and the same 4..1 butterfly.
+template<int NC, bool EXACT_N = false>
+__device__ __forceinline__ void row_dot_20_sub8_sm40(const uint8_t* s_row, const block_q8_1* __restrict__ x,
+                                                     const int (&off)[NC], int n, int t, float (&s)[NC]) {
+#pragma unroll
+    for (int c = 0; c < NC; ++c) s[c] = 0.0f;
+    float s16[NC], s8[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) { s16[c] = 0.0f; s8[c] = 0.0f; }
+    {
+        const int k = t;
+        const typename Split<40>::W w = nvfp4_w_sm40(s_row, k);
+        const int kbx = k >> 1, iqs = 4 * (k & 1);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (EXACT_N || c < n) s[c] += Split<40>::apply(w, x + off[c] + kbx * 2, iqs);
+    }
+    if (t < 4) {
+        const int k = t + 16;
+        const typename Split<40>::W w = nvfp4_w_sm40(s_row, k);
+        const int kbx = k >> 1, iqs = 4 * (k & 1);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (EXACT_N || c < n) s16[c] += Split<40>::apply(w, x + off[c] + kbx * 2, iqs);
+    }
+    {
+        const int k = t + 8;
+        const typename Split<40>::W w = nvfp4_w_sm40(s_row, k);
+        const int kbx = k >> 1, iqs = 4 * (k & 1);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (EXACT_N || c < n) s8[c] += Split<40>::apply(w, x + off[c] + kbx * 2, iqs);
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        if (EXACT_N || c < n) {
+            s[c] = __fadd_rn(__fadd_rn(s[c], s16[c]), __fadd_rn(s8[c], 0.0f));
+#pragma unroll
+            for (int o = 4; o > 0; o >>= 1) s[c] += __shfl_xor_sync(0xffffffffu, s[c], o);
+        }
+    }
+}
+
 template<int TY, bool STAGE_GRID = kStageIqGrid<TY>>
 __device__ __forceinline__ const uint32_t* stage_iq_grid(uint32_t* s_buf, int tid, int nthreads) {
     if constexpr (!STAGE_GRID) {
@@ -1371,7 +1486,8 @@ __global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned lon
                                                               const int32_t* __restrict__ n_groups,
                                                               const int32_t* __restrict__ ent_tok,
                                                               const block_q8_1* __restrict__ xq, NativeExpertLayout L,
-                                                              float* __restrict__ gate, float* __restrict__ up) {
+                                                              float* __restrict__ gate, float* __restrict__ up,
+                                                              bool stage40 = false) {
     const int ng = *n_groups;
     if (blockIdx.y >= ng) return;
     STRATA_SHARED_ALIGN16_U32(s_grid_buf, IqGridWords<TG, STAGE_GRID>::value);
@@ -1379,6 +1495,63 @@ __global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned lon
     const int nb = (int) (L.n_embd / Fmt<TG>::qk), xb = (int) (L.n_embd / 32);
     if constexpr (SUB16) {
         if (xb == 80) {
+            if constexpr (TG == 40) {
+                if (stage40 && L.n_ff % 16 == 0) {
+                    // STRATA_EXPERT_LOADS: the block's 16 rows staged once per group (a coalesced 16-byte
+                    // sweep), the half-blocks then read from shared.  n_ff % 16 == 0 and 2*n_ff/16 grid rows
+                    // mean a block's rows are whole, contiguous and inside one of gate or up.  The staging
+                    // buffer is DYNAMIC shared (launch_gu passes its bytes only when this path can run), so
+                    // the direct arm reserves nothing.
+                    constexpr int kRowB = 1440;                    // 40 blocks x 36 bytes = L.gu_row at xb 80
+                    extern __shared__ uint8_t s_w_dyn[];
+                    uint8_t* const s_w = (uint8_t*) (((uintptr_t) s_w_dyn + 15) & ~(uintptr_t) 15);
+                    const int subwarp = threadIdx.x >> 4, t = threadIdx.x & 15;
+                    const int row = blockIdx.x * 16 + subwarp;
+                    const bool is_up = row >= L.n_ff;
+                    const int r = is_up ? row - (int) L.n_ff : row;
+                    const int r0 = blockIdx.x * 16;                // the block's first row, in [0, 2*n_ff)
+                    const size_t w0 = r0 >= L.n_ff ? L.up_off + (size_t) (r0 - L.n_ff) * L.gu_row
+                                                   : (size_t) r0 * L.gu_row;
+                    float* dst = is_up ? up : gate;
+                    constexpr int kTotal = 16 * kRowB;
+                    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+                        const uint8_t* src = (const uint8_t*) grp_ptr[g] + w0;
+                        for (int i = (int) threadIdx.x * 16; i < kTotal; i += 256 * 16)
+                            *(uint4*) (s_w + i) = __ldcs((const uint4*) (src + i));
+                        __syncthreads();
+                        const float sc = L.tail_off ? ((const float*) ((const uint8_t*) grp_ptr[g] + L.tail_off))[is_up ? 1 : 0]
+                                                    : 1.0f;
+                        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+                        for (int e = e0; e < e1; e += GRP_NC) {
+                            const int n = min(GRP_NC, e1 - e);
+                            if (n == 1) {
+                                const int off1[1] = { ent_tok[e] * 80 };
+                                float s1[1];
+                                row_dot_80_sub16_sm40<1, true>(s_w + (size_t) subwarp * kRowB, xq, off1, 1, t, s1);
+                                if (t == 0) dst[(size_t) e * L.n_ff + r] = s1[0] * sc;
+                            } else if (n == 2) {
+                                const int off2[2] = { ent_tok[e] * 80, ent_tok[e + 1] * 80 };
+                                float s2[2];
+                                row_dot_80_sub16_sm40<2, true>(s_w + (size_t) subwarp * kRowB, xq, off2, 2, t, s2);
+                                if (t < 2) dst[(size_t) (e + t) * L.n_ff + r] = s2[t] * sc;
+                            } else if (n == 3) {
+                                const int off3[3] = { ent_tok[e] * 80, ent_tok[e + 1] * 80, ent_tok[e + 2] * 80 };
+                                float s3[3];
+                                row_dot_80_sub16_sm40<3, true>(s_w + (size_t) subwarp * kRowB, xq, off3, 3, t, s3);
+                                if (t < 3) dst[(size_t) (e + t) * L.n_ff + r] = s3[t] * sc;
+                            } else {
+                                const int off4[4] = { ent_tok[e] * 80, ent_tok[e + 1] * 80, ent_tok[e + 2] * 80,
+                                                      ent_tok[e + 3] * 80 };
+                                float s4[4];
+                                row_dot_80_sub16_sm40<4, true>(s_w + (size_t) subwarp * kRowB, xq, off4, 4, t, s4);
+                                if (t < 4) dst[(size_t) (e + t) * L.n_ff + r] = s4[t] * sc;
+                            }
+                        }
+                        __syncthreads();   // the next group's staging must not race this group's readers
+                    }
+                    return;
+                }
+            }
             const int subwarp = threadIdx.x >> 4, t = threadIdx.x & 15;
             const int row = blockIdx.x * 16 + subwarp;            // 0 .. 2*n_ff
             if (row >= 2 * L.n_ff) return;
@@ -1506,12 +1679,72 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
                                                                 const int32_t* __restrict__ n_groups,
                                                                 const int32_t* __restrict__ ent_dst,
                                                                 const block_q8_1* __restrict__ hq, NativeExpertLayout L,
-                                                                float* __restrict__ out) {
+                                                                float* __restrict__ out, bool stage40 = false) {
     const int ng = *n_groups;
     if (blockIdx.y >= ng) return;
     __shared__ uint32_t s_hq_buf[GRP_NC * 20 * 9];
     const int nb = (int) (L.n_ff / Fmt<TD>::qk), hb = (int) (L.n_ff / 32);
     if constexpr (SUB_DOWN && (TD == 20 || TD == 40)) {   // IQ4_NL (K 40) and NVFP4 (K 20): 8-lane rows
+        if constexpr (TD == 40) {
+            if (stage40 && hb == 20 && L.n_embd % 32 == 0) {
+                // STRATA_EXPERT_LOADS: the block's 32 down rows staged once per group.  d_row is 360 bytes
+                // (8- but not 16-aligned), so the sweep is 8-byte loads; the half-blocks then come from
+                // shared.  L.n_embd % 32 == 0 (checked at launch), so a block's rows are whole and contiguous.
+                // DYNAMIC shared as in native_gu_multi_kernel: the direct arm reserves nothing.
+                constexpr int kRowD = 360;                     // 10 blocks x 36 bytes = L.d_row at hb 20
+                extern __shared__ uint8_t s_w_dyn[];
+                uint8_t* const s_w = (uint8_t*) (((uintptr_t) s_w_dyn + 15) & ~(uintptr_t) 15);
+                const int r = blockIdx.x * 32 + (threadIdx.x >> 3);
+                const int t = threadIdx.x & 7;
+                const bool valid_r = r < L.n_embd;
+                const int r0 = blockIdx.x * 32;
+                const size_t w0 = L.down_off + (size_t) r0 * L.d_row;
+                const block_q8_1* s_hq = reinterpret_cast<const block_q8_1*>(s_hq_buf);
+                constexpr int kTotal = 32 * kRowD;
+                for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+                    const uint8_t* src = (const uint8_t*) grp_ptr[g] + w0;
+                    for (int i = (int) threadIdx.x * 8; i < kTotal; i += 256 * 8)
+                        *(uint2*) (s_w + i) = __ldcs((const uint2*) (src + i));
+                    __syncthreads();
+                    const float sd = L.tail_off ? ((const float*) ((const uint8_t*) grp_ptr[g] + L.tail_off))[2] : 1.0f;
+                    const int e0 = grp_start[g], e1 = grp_start[g + 1];
+                    for (int e = e0; e < e1; e += GRP_NC) {
+                        const int n = min(GRP_NC, e1 - e);
+                        const uint32_t* hsrc = reinterpret_cast<const uint32_t*>(hq + (size_t) e * 20);
+                        const int words = n * (20 * 9);
+                        __syncthreads();
+                        for (int i = threadIdx.x; i < words; i += 256) s_hq_buf[i] = hsrc[i];
+                        __syncthreads();
+                        if (valid_r) {
+                            const uint8_t* s_row = s_w + (size_t) (threadIdx.x >> 3) * kRowD;
+                            if (n == 1) {
+                                const int off1[1] = { 0 };
+                                float s1[1];
+                                row_dot_20_sub8_sm40<1, true>(s_row, s_hq, off1, 1, t, s1);
+                                if (t == 0) out[(size_t) ent_dst[e] * L.n_embd + r] = s1[0] * sd;
+                            } else if (n == 2) {
+                                const int off2[2] = { 0, 20 };
+                                float s2[2];
+                                row_dot_20_sub8_sm40<2, true>(s_row, s_hq, off2, 2, t, s2);
+                                if (t < 2) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s2[t] * sd;
+                            } else if (n == 3) {
+                                const int off3[3] = { 0, 20, 40 };
+                                float s3[3];
+                                row_dot_20_sub8_sm40<3, true>(s_row, s_hq, off3, 3, t, s3);
+                                if (t < 3) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s3[t] * sd;
+                            } else {
+                                const int off4[4] = { 0, 20, 40, 60 };
+                                float s4[4];
+                                row_dot_20_sub8_sm40<4, true>(s_row, s_hq, off4, 4, t, s4);
+                                if (t < 4) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s4[t] * sd;
+                            }
+                        }
+                    }
+                    __syncthreads();   // the next group's weight staging must not race this group's readers
+                }
+                return;
+            }
+        }
         if (hb == 20) {
             const int r = blockIdx.x * 32 + (threadIdx.x >> 3);
             const int t = threadIdx.x & 7;
@@ -2844,19 +3077,23 @@ template<int TG>
 void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
                const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X, const NativeExpertLayout& L,
                float* gate, float* up) {
+    // the shared-staged NVFP4 loads' dynamic buffer: 16 rows x 1440 bytes + align slack, passed only when the
+    // staged branch can run, so the direct arm reserves no shared
+    const size_t sm40 = (TG == 40 && g_stage_loads && !g_no_sub16_gu && L.n_embd / 32 == 80 && L.n_ff % 16 == 0)
+                            ? (size_t) 16 * 1440 + 16 : 0;
     if constexpr (!kSplit<TG>) native_gu_kernel<TG><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
     else if (g_old_kernels) native_gu_kernel<TG><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
     else if constexpr (kStageIqGrid<TG>) {
         if (!g_stage_grid) {
             if (g_no_sub16_gu) native_gu_multi_kernel<TG, false, false><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
-            else native_gu_multi_kernel<TG, false, true><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+            else native_gu_multi_kernel<TG, false, true><<<grid, 256, sm40, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, sm40 != 0);
             return;
         }
         if (g_no_sub16_gu) native_gu_multi_kernel<TG, true, false><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
-        else native_gu_multi_kernel<TG, true, true><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+        else native_gu_multi_kernel<TG, true, true><<<grid, 256, sm40, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, sm40 != 0);
     } else {
         if (g_no_sub16_gu) native_gu_multi_kernel<TG, false, false><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
-        else native_gu_multi_kernel<TG, false, true><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+        else native_gu_multi_kernel<TG, false, true><<<grid, 256, sm40, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, sm40 != 0);
     }
 }
 
@@ -2864,16 +3101,22 @@ template<int TD>
 void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
                  const int32_t* n_groups, const int32_t* ent_dst, const block_q8_1* hq, const NativeExpertLayout& L,
                  float* out) {
+    // as launch_gu: the staged down path's dynamic buffer, 32 rows x 360 bytes + align slack, only when it runs
+    const size_t sm40 = (TD == 40 && g_stage_loads && !g_no_sub16_gu && L.n_ff / 32 == 20 && L.n_embd % 32 == 0)
+                            ? (size_t) 32 * 360 + 16 : 0;
     if constexpr (!kSplit<TD>) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else if (g_old_kernels) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else if (g_no_sub16_gu) native_down_multi_kernel<TD, false><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
-    else native_down_multi_kernel<TD, true><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    else native_down_multi_kernel<TD, true><<<grid, 256, sm40, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, sm40 != 0);
 }
 
 }  // namespace
 
 void iq_set_old_kernels(bool old) { g_old_kernels = old; }
 bool iq_old_kernels() { return g_old_kernels; }
+
+void iq_set_expert_loads(bool on) { g_stage_loads = on; }
+bool iq_expert_loads() { return g_stage_loads; }
 
 bool iq_supported(int t) noexcept { return is_iq(t); }
 bool embed_type_supported(int t) noexcept { return is_iq(t) || t == 30; }

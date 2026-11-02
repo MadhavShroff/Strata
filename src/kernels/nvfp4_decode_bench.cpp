@@ -47,10 +47,16 @@ int main(int argc, char** argv) {
     const int gu = argc > 2 ? std::atoi(argv[1]) : 40, dt = argc > 2 ? std::atoi(argv[2]) : 40;
     const int G = argc > 3 ? std::atoi(argv[3]) : 64, TPG = argc > 4 ? std::atoi(argv[4]) : 2;
     const int IT = argc > 5 ? std::atoi(argv[5]) : 50;
+    // argv[6] (or NVFP4_BENCH_T): the window's token rows, 1..16 (the engine's kVerifyMaxT windows; the entries'
+    // tok ids are taken modulo it).  12 is the raised window; 8 the current one.
+    int T = 8;
+    if (const char* e = std::getenv("NVFP4_BENCH_T")) T = std::atoi(e);
+    if (argc > 6) T = std::atoi(argv[6]);
+    if (T < 1 || T > 16) { std::fprintf(stderr, "window tokens 1..16\n"); return 2; }
     constexpr int64_t N = 2560, FF = 640;
     if (!k::native_expert_supported(gu, dt, N, FF)) { std::fprintf(stderr, "types %d/%d not supported\n", gu, dt); return 2; }
     const k::NativeExpertLayout L = k::native_expert_layout(gu, dt, N, FF);
-    const int E = G * TPG, T = 8;                      // entries; tokens of the window (activations)
+    const int E = G * TPG;                             // entries; T = the window's tokens (activations)
     std::mt19937 rng(20261012);
     std::vector<uint8_t> blobs((size_t) G * L.bytes);
     for (auto& b : blobs) b = (uint8_t) (rng() & 0xFF);
@@ -117,40 +123,67 @@ int main(int argc, char** argv) {
     ck(cudaMemcpy(dtok, tok.data(), 4 * E, cudaMemcpyHostToDevice), "t");
     k::quantize_q8_1_rows(dx, T, N, dxq, nullptr);
     // NVFP4_BENCH_PHASE=1: gate/up + SwiGLU + quantize only, 2: down only (native_expert_set_mode), 0/unset: all
-    if (const char* ph = std::getenv("NVFP4_BENCH_PHASE")) k::native_expert_set_mode(-1, std::atoi(ph));
+    int ph = 0;
+    if (const char* p = std::getenv("NVFP4_BENCH_PHASE")) ph = std::atoi(p);
+    if (ph) k::native_expert_set_mode(-1, ph);
     auto run = [&] { k::native_expert_grouped(L, dptr, dstart, dng, ddst, dtok, G, E, dxq, scr, dout, nullptr); };
-    run();
-    ck(cudaDeviceSynchronize(), "warm");
-    std::vector<float> out((size_t) E * N);
-    ck(cudaMemcpy(out.data(), dout, out.size() * 4, cudaMemcpyDeviceToHost), "out");
-    uint64_t h = 1469598103934665603ull;               // FNV-1a over the output bytes
-    for (const float& v : out) {
-        const auto* p = reinterpret_cast<const uint8_t*>(&v);
-        for (int i = 0; i < 4; ++i) h = (h ^ p[i]) * 1099511628211ull;
-    }
+    // the output hash of one arm (STRATA_EXPERT_LOADS off = the direct 4-byte loads, on = the shared-staged path)
+    auto hash_of = [&](bool loads) {
+        k::iq_set_expert_loads(loads);
+        ck(cudaMemset(dout, 0xFF, (size_t) E * N * 4), "clr");
+        run();
+        ck(cudaDeviceSynchronize(), "run");
+        std::vector<float> out((size_t) E * N);
+        ck(cudaMemcpy(out.data(), dout, out.size() * 4, cudaMemcpyDeviceToHost), "out");
+        uint64_t h = 1469598103934665603ull;           // FNV-1a over the output bytes
+        for (const float& v : out) {
+            const auto* p = reinterpret_cast<const uint8_t*>(&v);
+            for (int i = 0; i < 4; ++i) h = (h ^ p[i]) * 1099511628211ull;
+        }
+        return h;
+    };
+    const uint64_t h_direct = hash_of(false);
+    const bool ab = gu == 40 || dt == 40;
+    const uint64_t h_staged = ab ? hash_of(true) : h_direct;
     cudaEvent_t a, b;
     cudaEventCreate(&a);
     cudaEventCreate(&b);
-    float best = 1e30f, sum = 0.f;
-    for (int i = 0; i < IT; ++i) {
-        cudaEventRecord(a);
-        run();
-        cudaEventRecord(b);
-        cudaEventSynchronize(b);
-        float ms = 0.f;
-        cudaEventElapsedTime(&ms, a, b);
-        best = ms < best ? ms : best;
-        sum += ms;
-    }
+    // the arms ALTERNATE, three rounds each keeping its minimum (a card under sustained load steps its clocks;
+    // a fixed order would flatter whichever arm ran first)
+    float best[2] = {1e30f, 1e30f};
+    for (int round = 0; round < 3; ++round)
+        for (int arm = 0; arm < (ab ? 2 : 1); ++arm) {
+            k::iq_set_expert_loads(arm == 1);
+            for (int i = 0; i < 5; ++i) run();         // warm
+            for (int i = 0; i < IT; ++i) {
+                cudaEventRecord(a);
+                run();
+                cudaEventRecord(b);
+                cudaEventSynchronize(b);
+                float ms = 0.f;
+                cudaEventElapsedTime(&ms, a, b);
+                if (ms < best[arm]) best[arm] = ms;
+            }
+        }
+    k::iq_set_expert_loads(false);
     ck(cudaGetLastError(), "run");
     int dev = 0, bus = 0, clk = 0;
     cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&bus, cudaDevAttrGlobalMemoryBusWidth, dev);
     cudaDeviceGetAttribute(&clk, cudaDevAttrMemoryClockRate, dev);   // kHz
     const double peak = 2.0 * clk * 1e3 * (bus / 8) / 1e9;            // GB/s, DDR
-    const double bytes = (double) G * (double) L.bytes;
-    std::printf("types %d/%d  blob %zu B  groups %d x %d tokens: best %.3f ms  mean %.3f ms  -> %.1f GB/s of weights "
-                "(%.0f%% of the %.0f GB/s DRAM peak)  out hash %016llx\n", gu, dt, L.bytes, G, TPG, best, sum / IT,
-                bytes / (best * 1e6), 100.0 * bytes / (best * 1e6) / peak, peak, (unsigned long long) h);
-    return 0;
+    // the weight bytes the phase actually streams: gate/up is down_off bytes per expert, down the rest to the
+    // tail (the whole blob when there is no tail)
+    const double gu_b = (double) G * (double) L.down_off;
+    const double d_b = (double) G * (double) (L.tail_off ? L.tail_off - L.down_off : L.bytes - L.down_off);
+    const double bytes = ph == 1 ? gu_b : ph == 2 ? d_b : gu_b + d_b;
+    std::printf("types %d/%d  blob %zu B  T %d  groups %d x %d tokens  phase %d:  direct %.3f ms -> %.1f GB/s",
+                gu, dt, L.bytes, T, G, TPG, ph, best[0], bytes / (best[0] * 1e6));
+    if (ab)
+        std::printf("  |  staged %.3f ms -> %.1f GB/s (%.0f%% of direct)  hashes %s", best[1],
+                    bytes / (best[1] * 1e6), 100.0 * best[0] / best[1],
+                    h_direct == h_staged ? "bitwise equal" : "DIFFER");
+    std::printf("  (%.0f%% of the %.0f GB/s DDR peak)  out hash %016llx\n", 100.0 * bytes / (best[0] * 1e6) / peak,
+                peak, (unsigned long long) h_direct);
+    return h_direct == h_staged ? 0 : 1;
 }
