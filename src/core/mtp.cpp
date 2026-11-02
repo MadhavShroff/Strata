@@ -1808,7 +1808,7 @@ int MtpDrafter::chain_poll(std::string& err) {
         chain_tok_[j] = ((volatile int32_t*) h_out_)[j];
         chain_prob_[j] = ((volatile float*) h_prob_)[j];
     }
-    for (int j = chain_n_; j < 8; ++j) { chain_tok_[j] = 0; chain_prob_[j] = 0.0f; }
+    for (int j = chain_n_; j < strata::kernels::kVerifyMaxT; ++j) { chain_tok_[j] = 0; chain_prob_[j] = 0.0f; }
     return 1;
 }
 

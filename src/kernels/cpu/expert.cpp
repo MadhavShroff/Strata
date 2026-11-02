@@ -479,7 +479,11 @@ void s2_expert_gu_rows_multi(const uint8_t* blob, const ActQ* const* a1, int n_t
         case 5: gu_rows_multi<5>(blob, a1, ff, r0, r1); break;
         case 6: gu_rows_multi<6>(blob, a1, ff, r0, r1); break;
         case 7: gu_rows_multi<7>(blob, a1, ff, r0, r1); break;
-        default: gu_rows_multi<8>(blob, a1, ff, r0, r1); break;
+        case 8: gu_rows_multi<8>(blob, a1, ff, r0, r1); break;
+        case 9: gu_rows_multi<9>(blob, a1, ff, r0, r1); break;
+        case 10: gu_rows_multi<10>(blob, a1, ff, r0, r1); break;
+        case 11: gu_rows_multi<11>(blob, a1, ff, r0, r1); break;
+        default: gu_rows_multi<MAXT>(blob, a1, ff, r0, r1); break;
     }
 }
 
@@ -493,7 +497,11 @@ void s2_expert_down_rows_multi(const uint8_t* blob, const ActQ* const* a2, int n
         case 5: down_rows_multi<5>(blob, a2, out, r0, r1); break;
         case 6: down_rows_multi<6>(blob, a2, out, r0, r1); break;
         case 7: down_rows_multi<7>(blob, a2, out, r0, r1); break;
-        default: down_rows_multi<8>(blob, a2, out, r0, r1); break;
+        case 8: down_rows_multi<8>(blob, a2, out, r0, r1); break;
+        case 9: down_rows_multi<9>(blob, a2, out, r0, r1); break;
+        case 10: down_rows_multi<10>(blob, a2, out, r0, r1); break;
+        case 11: down_rows_multi<11>(blob, a2, out, r0, r1); break;
+        default: down_rows_multi<MAXT>(blob, a2, out, r0, r1); break;
     }
 }
 
@@ -554,7 +562,11 @@ void q2_0_gguf_rows_multi(const uint8_t* w, size_t row_bytes, int nblocks, const
         case 5: q2g_rows<5>(w, row_bytes, nblocks, a, out, r0, r1); break;
         case 6: q2g_rows<6>(w, row_bytes, nblocks, a, out, r0, r1); break;
         case 7: q2g_rows<7>(w, row_bytes, nblocks, a, out, r0, r1); break;
-        default: q2g_rows<8>(w, row_bytes, nblocks, a, out, r0, r1); break;
+        case 8: q2g_rows<8>(w, row_bytes, nblocks, a, out, r0, r1); break;
+        case 9: q2g_rows<9>(w, row_bytes, nblocks, a, out, r0, r1); break;
+        case 10: q2g_rows<10>(w, row_bytes, nblocks, a, out, r0, r1); break;
+        case 11: q2g_rows<11>(w, row_bytes, nblocks, a, out, r0, r1); break;
+        default: q2g_rows<MAXT>(w, row_bytes, nblocks, a, out, r0, r1); break;
     }
 }
 
@@ -572,7 +584,11 @@ void s2_expert_vnni_multi(const uint8_t* blob, const ActQ* const* a1, int n_toke
         case 5: expert_multi<5>(blob, a1, out, ws); break;
         case 6: expert_multi<6>(blob, a1, out, ws); break;
         case 7: expert_multi<7>(blob, a1, out, ws); break;
-        default: expert_multi<8>(blob, a1, out, ws); break;
+        case 8: expert_multi<8>(blob, a1, out, ws); break;
+        case 9: expert_multi<9>(blob, a1, out, ws); break;
+        case 10: expert_multi<10>(blob, a1, out, ws); break;
+        case 11: expert_multi<11>(blob, a1, out, ws); break;
+        default: expert_multi<MAXT>(blob, a1, out, ws); break;
     }
 }
 

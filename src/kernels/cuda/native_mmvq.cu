@@ -28,6 +28,7 @@
 #include "strata/kernels/q8_1_finite.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/gfx_arch.hpp"
+#include "strata/kernels/verify_kernels.hpp"   // kVerifyMaxT: MAX_NCOLS is that constant
 #include "s26_tsum.cuh"
 #if !defined(__HIPCC__)
 #include "q8_1_il.cuh"
@@ -817,7 +818,7 @@ __global__ void native_small_mmvq_kernel(const Weight* __restrict__ w,
     }
 }
 
-// ============================ plan v0.3 P3: ncols = 2..8 (speculative verify, small batches) ============================
+// ============================ plan v0.3 P3: ncols = 2..12 (speculative verify, small batches) ============================
 //
 // One generic kernel for every format, parameterized by the format's iteration traits below, which are
 // transcribed from the ncols = 1 kernels above (same thread-to-block mapping, same blocks per iteration, same
@@ -825,7 +826,7 @@ __global__ void native_small_mmvq_kernel(const Weight* __restrict__ w,
 // row) value is accumulated over kbx in the same order, summed across warps in the same order and reduced with
 // the same warp tree as the ncols = 1 kernel, so every column is BITWISE equal to a single-column call on that
 // column (checked by bench/micro/native_mmvq_multi.cpp). The ncols = 1 kernels are untouched.
-constexpr int MAX_NCOLS = 8;
+constexpr int MAX_NCOLS = strata::kernels::kVerifyMaxT;   // a verify window's rows: 9..12 added with the 12-row window
 
 // Each format splits its dot product into `load` (everything that depends only on the weight block: codes,
 // unpacked scales, block scale) and `apply` (the activation loads and the original *_impl expression). `load` runs
@@ -1347,7 +1348,11 @@ void launch_multi(const void* weights, const void* x_q8_1, float* y, int n_in, i
         case 6: launch_multi_n<F, 6>(weights, x_q8_1, y, n_in, n_out, s); break;
         case 7: launch_multi_n<F, 7>(weights, x_q8_1, y, n_in, n_out, s); break;
         case 8: launch_multi_n<F, 8>(weights, x_q8_1, y, n_in, n_out, s); break;
-        default: throw std::invalid_argument("native MMVQ multi-column launch requires 2 <= ncols <= 8");
+        case 9: launch_multi_n<F, 9>(weights, x_q8_1, y, n_in, n_out, s); break;
+        case 10: launch_multi_n<F, 10>(weights, x_q8_1, y, n_in, n_out, s); break;
+        case 11: launch_multi_n<F, 11>(weights, x_q8_1, y, n_in, n_out, s); break;
+        case 12: launch_multi_n<F, 12>(weights, x_q8_1, y, n_in, n_out, s); break;
+        default: throw std::invalid_argument("native MMVQ multi-column launch requires 2 <= ncols <= 12");
     }
 }
 
@@ -1596,7 +1601,7 @@ void validate_shape(int n_in, int ncols, int block_elems = Q8K) {
     if (n_in <= 0 || n_in % block_elems != 0) {
         throw std::invalid_argument("native MMVQ requires n_in > 0 and divisible by its block element count");
     }
-    if (ncols < 1 || ncols > MAX_NCOLS) throw std::invalid_argument("native MMVQ requires 1 <= ncols <= 8");
+    if (ncols < 1 || ncols > MAX_NCOLS) throw std::invalid_argument("native MMVQ requires 1 <= ncols <= 12");
 }
 void validate_pointer(const void* p) {
     if (!p || reinterpret_cast<std::uintptr_t>(p) % 4 != 0) {
@@ -1618,7 +1623,7 @@ void launch_check() {
 // ---- AMD (wave64) layout: one wavefront per R rows, four wavefronts per block, the row's blocks strided over the
 // 64 lanes exactly as the CUDA kernels stride them over a block (kbx = lane / T, stride 64 / T), and a 64-lane
 // butterfly instead of the LDS partials and __syncthreads of the one-block-per-row layout: on gfx906 a block per
-// 2 KB row spent most of its time being launched and joined.  The SAME kernel serves every column count 1..8, so a
+// 2 KB row spent most of its time being launched and joined.  The SAME kernel serves every column count 1..12, so a
 // column's sums do not depend on how many columns (verify tokens) ride along.  STRATA_MMVQ_WAVE=0: the CUDA layout.
 bool g_wave_off = std::getenv("STRATA_MMVQ_WAVE") && std::string(std::getenv("STRATA_MMVQ_WAVE")) == "0";
 template<typename F, int NCOLS, int R>
@@ -1675,7 +1680,11 @@ void wave_launch(const void* weights, const void* x_q8_1, float* y, int n_in, in
         case 6: wave_launch_n<F, 6>(weights, x_q8_1, y, n_in, n_out, s); break;
         case 7: wave_launch_n<F, 7>(weights, x_q8_1, y, n_in, n_out, s); break;
         case 8: wave_launch_n<F, 8>(weights, x_q8_1, y, n_in, n_out, s); break;
-        default: throw std::invalid_argument("native MMVQ (wave) requires 1 <= ncols <= 8");
+        case 9: wave_launch_n<F, 9>(weights, x_q8_1, y, n_in, n_out, s); break;
+        case 10: wave_launch_n<F, 10>(weights, x_q8_1, y, n_in, n_out, s); break;
+        case 11: wave_launch_n<F, 11>(weights, x_q8_1, y, n_in, n_out, s); break;
+        case 12: wave_launch_n<F, 12>(weights, x_q8_1, y, n_in, n_out, s); break;
+        default: throw std::invalid_argument("native MMVQ (wave) requires 1 <= ncols <= 12");
     }
 }
 #define STRATA_WAVE_MMVQ(...) \
@@ -1845,7 +1854,11 @@ bool q8_packed_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in,
         case 6: q8_packed_launch<6>(found->second, x, y, s); break;
         case 7: q8_packed_launch<7>(found->second, x, y, s); break;
         case 8: q8_packed_launch<8>(found->second, x, y, s); break;
-        default: throw std::invalid_argument("native MMVQ requires 1 <= ncols <= 8");
+        case 9: q8_packed_launch<9>(found->second, x, y, s); break;
+        case 10: q8_packed_launch<10>(found->second, x, y, s); break;
+        case 11: q8_packed_launch<11>(found->second, x, y, s); break;
+        case 12: q8_packed_launch<12>(found->second, x, y, s); break;
+        default: throw std::invalid_argument("native MMVQ requires 1 <= ncols <= 12");
     }
     launch_check();
     return true;
@@ -1980,7 +1993,11 @@ bool q6_packed_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in,
         case 6: q6_packed_launch<6>(found->second, x, y, s); break;
         case 7: q6_packed_launch<7>(found->second, x, y, s); break;
         case 8: q6_packed_launch<8>(found->second, x, y, s); break;
-        default: throw std::invalid_argument("native MMVQ requires 1 <= ncols <= 8");
+        case 9: q6_packed_launch<9>(found->second, x, y, s); break;
+        case 10: q6_packed_launch<10>(found->second, x, y, s); break;
+        case 11: q6_packed_launch<11>(found->second, x, y, s); break;
+        case 12: q6_packed_launch<12>(found->second, x, y, s); break;
+        default: throw std::invalid_argument("native MMVQ requires 1 <= ncols <= 12");
     }
     launch_check();
     return true;
@@ -2463,7 +2480,7 @@ bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void*
                       int n_in, int n_out, int ncols, void* stream) {
     using F = SmallTraits<Q80Block, 8>;
     // only where both calls would run native_mmvq_multi_kernel<F, ncols, WARPS, 1> (exact layout, not packed)
-    if (ggml_type != 8 || !g_multi_exact || ncols < 2 || ncols > 8 || n_out <= 0 || n_in <= 0 || n_in % 32 != 0 ||
+    if (ggml_type != 8 || !g_multi_exact || ncols < 2 || ncols > kVerifyMaxT || n_out <= 0 || n_in <= 0 || n_in % 32 != 0 ||
         n_in / F::DIV < F::BPI || !w1 || !w2 || !x_q8_1 || !y1 || !y2 || !stream)
         return false;
     const auto& reg = q8_packed_registry();
@@ -2479,7 +2496,11 @@ bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void*
         case 5: q8_0_pair_launch<5>(a, b, x, y1, y2, n_in, n_out, s); break;
         case 6: q8_0_pair_launch<6>(a, b, x, y1, y2, n_in, n_out, s); break;
         case 7: q8_0_pair_launch<7>(a, b, x, y1, y2, n_in, n_out, s); break;
-        default: q8_0_pair_launch<8>(a, b, x, y1, y2, n_in, n_out, s); break;
+        case 8: q8_0_pair_launch<8>(a, b, x, y1, y2, n_in, n_out, s); break;
+        case 9: q8_0_pair_launch<9>(a, b, x, y1, y2, n_in, n_out, s); break;
+        case 10: q8_0_pair_launch<10>(a, b, x, y1, y2, n_in, n_out, s); break;
+        case 11: q8_0_pair_launch<11>(a, b, x, y1, y2, n_in, n_out, s); break;
+        default: q8_0_pair_launch<12>(a, b, x, y1, y2, n_in, n_out, s); break;
     }
     launch_check();
     return true;

@@ -4,7 +4,7 @@
 //     build/iq_multi_parity            the checks (a ctest; needs the GPU)
 //     build/iq_multi_parity --bench    the checks, then old/new timings of both paths
 //
-// (1) iq_mmvq, every format it takes, ncols 1..8 and 11 (the > 8 split): the new output must be BITWISE equal to
+// (1) iq_mmvq, every format it takes, ncols 1..12 (the > 8 chunked split included): the new output must be BITWISE equal to
 //     the old one (iq_set_old_kernels), and within float rounding of a double reference built from the GPU's own
 //     dequantizer (validated against gguf-py by iq_parity) and the dequantized q8_1 activations - a gross-error
 //     guard, not the contract.
@@ -16,6 +16,7 @@
 // are set, small enough that the grouped path's SwiGLU output keeps a finite fp16 q8_1 scale.
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
 #include <cuda_runtime.h>
@@ -129,7 +130,7 @@ void check_mmvq(int t, int n_in, int n_out, cudaStream_t s, std::mt19937& rng) {
     float* dy_old = dalloc<float>((size_t) max_cols * n_out);
     float* dy_new = dalloc<float>((size_t) max_cols * n_out);
     std::vector<float> y_old((size_t) max_cols * n_out), y_new(y_old.size());
-    const int cols[] = {1, 2, 3, 4, 5, 6, 7, 8, 11};
+    const int cols[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
     int bad = 0;
     double worst = 0.0;
     for (int nc : cols) {
@@ -163,7 +164,7 @@ void check_mmvq(int t, int n_in, int n_out, cudaStream_t s, std::mt19937& rng) {
             ++bad;
         }
     }
-    std::printf("%-8s type %2d  %5d x %5d  iq_mmvq ncols 1..8, 11: %s (ref rel <= %.2e)\n", name_of(t), t, n_out, n_in,
+    std::printf("%-8s type %2d  %5d x %5d  iq_mmvq ncols 1..12: %s (ref rel <= %.2e)\n", name_of(t), t, n_out, n_in,
                 bad ? "FAIL" : "bitwise equal to the old kernel", worst);
     g_fail += bad;
     cudaFree(dw); cudaFree(dwf); cudaFree(dx); cudaFree(dxq); cudaFree(dy_old); cudaFree(dy_new);
@@ -300,7 +301,7 @@ void bench(cudaStream_t s, std::mt19937& rng) {
         k::quantize_q8_1_rows(dx, 8, n_in, dxq, s);
         float* dy = dalloc<float>((size_t) 8 * n_out);
         std::printf("%-8s iq_mmvq %d x %d:", name_of(t), n_out, n_in);
-        for (int nc = 1; nc <= 8; ++nc) {
+        for (int nc = 1; nc <= k::kVerifyMaxT; ++nc) {
             float us[2];
             for (int old = 1; old >= 0; --old) {
                 k::iq_set_old_kernels(old != 0);

@@ -723,8 +723,9 @@ void usage() {
                  "                       slightly lower precision (see bench/results/2026-09-27-kv-q4)\n"
                  "  --kv k8v4            hybrid: INT8 K (exact attention scores) + rotated Q4_0 V, 816 B/cell\n"
                  "                       (vs int8's 1,056); streams with --kv-resident too\n"
-                 "  --kv-resident N      KV streaming: keep N cells of each QSA layer in VRAM (min 20480) and the\n"
-                 "                       whole K/V in pinned RAM; the freed VRAM goes to expert slots. 0 (default):\n"
+                 "  --kv-resident N      KV streaming: keep N cells of each QSA layer in VRAM (min 30720, the\n"
+                 "                       verify-window floor) and the whole K/V in pinned RAM; the freed VRAM\n"
+                 "                       goes to expert slots. 0 (default):\n"
                  "                       all of it in VRAM. A context of N cells or fewer is not streamed\n"
                  "  --kv-grow            the K/V takes VRAM only for the cells the requests reach and the expert\n"
                  "                       cache holds the rest, giving slots back as the context grows (one GPU, with\n"
@@ -797,8 +798,8 @@ void usage() {
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
                  "                       give VRAM back to other programs between requests and take it back later\n"
-                 "  --batch N / --slots N  --serve (opt-in): up to N requests decode together in batch slots (2..8\n"
-                 "                       normally; --batch-mtp waves more through eight-row windows),\n"
+                 "  --batch N / --slots N  --serve (opt-in): up to N requests decode together in batch slots (2..12\n"
+                 "                       normally; --batch-mtp waves more through twelve-row windows),\n"
                  "                       each slot with its own session (VRAM like the main one); docs/BATCHING.md\n"
                  "  --batch-mtp          --batch (opt-in, needs --mtp and --spec): each slot also verifies one MTP proposal per\n"
                  "                       window (STRATA_BATCH_MTP=1 does the same); works on one GPU and on a layer split (the\n"
@@ -827,7 +828,7 @@ void usage() {
                  "  --spec-min-p P       how sure the draft layer must be to extend a verify window by another guess\n"
                  "                       (setup writes 0.5; --calibrate measures it on this PC, see docs/DETAILS.md)\n"
                  "  --lookup-chain K     opt-in: after the MTP's drafts, add up to K prompt-lookup drafts that continue\n"
-                 "                       them (the window grows to at most 8; default 0 = off)\n"
+                 "                       them (the window grows to at most 12; default 0 = off)\n"
                  "  --lookup-chain-min M  the shortest context match --lookup-chain extends on (default 3)\n"
                  "  --mtp-hnorm pooled|stream  the draft layer's hidden-input norm: one RMS over all four streams\n"
                  "                       (default) or one per stream (llama.cpp's MTP graph)\n"
@@ -2566,12 +2567,13 @@ int main(int argc, char** argv) {
     // edits +6-11%, ordinary text unchanged (bench/results/2026-09-27-spec). --suffix-draft 0 turns it off.
     if (o.suffix_draft > 0 && o.spec >= 2 && o.mtp_max_t == 0) {
         o.mtp_max_t = o.spec;
-        o.spec = std::min(o.spec + 2, 8);   // kVerifyMaxT
+        o.spec = std::min(o.spec + 2, strata::kernels::kVerifyMaxT);
     }
     // --lookup-chain (opt-in): the MTP keeps its windows; a lookup chained after its drafts may lengthen one by up to K
     if (o.lookup_chain > 0 && o.spec >= 2) {
         if (o.mtp_max_t == 0) o.mtp_max_t = o.spec;
-        o.spec = std::max(o.spec, std::min(o.mtp_max_t + o.lookup_chain, 8));   // kVerifyMaxT
+        o.spec = std::max(o.spec, std::min(o.mtp_max_t + o.lookup_chain,
+                                        (int) strata::kernels::kVerifyMaxT));   // kVerifyMaxT
     }
     strata::core::layer_set_shared_early(!o.shared_late);
     if (!o.native_preset.empty()) {
@@ -7950,6 +7952,11 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             return 1;
         }
+        if (o.batch > 0)   // the row cap of one captured batch window (what the batch stats' avg rows counts to)
+            std::fprintf(stderr, "strata serve: batch windows of up to %d rows%s\n",
+                         batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch),
+                         batch_mtp ? " (--batch-mtp: 2 rows per slot, so one window holds every active slot up to 6)"
+                                   : " (one row per slot)");
         if (prefill_head_alias_bound) mtp.set_window_R(ver.final_R_all());
         if (pipe) mtp.set_source_R(ver.final_R_all());   // the serial decode's rows (the last stage's even verifier)
         auto free_slot_mtp_rows = [](float* p) { if (p != nullptr) (void) cudaFree(p); };
