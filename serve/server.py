@@ -735,6 +735,133 @@ FATAL_PREFIXES = ("ERR verify: timed out at layer ", "ERR verify batch: timed ou
                   "ERR verify: an earlier window never finished", "ERR verify batch: an earlier window never finished")
 
 
+# The memory guard (measurement-34): the host K/V a request can ADD to a batch slot, per cell. The engine does not
+# report its geometry on INFO, so this is the measured constant of the served model (Qwen3.8-Flash-Next NVFP4):
+# 1,056 bytes per cell per QSA layer in KV int8 (k + v + scales) x 12 full-attention layers. The engine's own
+# release (its "kv host:" log lines) gives these pages back at a fresh start; this is the server's side of the
+# same decision: admit a request only while free host memory covers what it can add above a floor.
+KV_HOST_BYTES_PER_CELL = 12672
+
+
+def available_host_bytes() -> int | None:
+    """MemAvailable from /proc/meminfo, made no more generous by the cgroup the server sits in: the tightest of
+    MemAvailable and (memory.max - memory.current) over the cgroup levels of this process (v2 walk from the root
+    to the job's own group; v1's single memory group). None when MemAvailable itself cannot be read. Unlike the
+    engine's parking guard (conversation_memory.cpp) this credits no reclaimable file cache: admission is
+    decided on the pessimistic side."""
+    try:
+        with open("/proc/meminfo", "rb") as f:
+            for line in f:
+                if line.startswith(b"MemAvailable:"):
+                    available = int(line.split()[1]) * 1024
+                    break
+            else:
+                return None
+    except (OSError, ValueError, IndexError):
+        return None
+    cgroup = None
+    try:
+        with open("/proc/self/cgroup", "rb") as f:
+            for line in f:
+                parts = line.decode("utf-8", "replace").rstrip("\n").split(":", 2)
+                if len(parts) == 3 and parts[0] == "0" and parts[1] == "":
+                    cgroup = ("/sys/fs/cgroup" + parts[2], "memory.max", "memory.current")
+                elif len(parts) == 3 and parts[1] == "memory":
+                    cgroup = ("/sys/fs/cgroup/memory" + parts[2], "memory.limit_in_bytes", "memory.usage_in_bytes")
+    except OSError:
+        cgroup = None
+    while cgroup is not None:
+        base, limit_name, current_name = cgroup
+        cgroup = None if base in ("/sys/fs/cgroup", "/sys/fs/cgroup/memory") else (
+            base.rsplit("/", 1)[0], limit_name, current_name)
+        try:
+            with open(f"{base}/{limit_name}", "rb") as f:
+                raw = f.read().strip()
+            if raw != b"max":
+                with open(f"{base}/{current_name}", "rb") as f:
+                    current = int(f.read().split()[0])
+                available = min(available, max(0, int(raw) - current))
+        except (OSError, ValueError, IndexError):
+            pass
+    return available
+
+
+class MemoryGuard:
+    """The memory guard (measurement-34): a request enters a batch slot only while free host memory covers the
+    host K/V it can add, above a floor. The estimate is (prompt tokens + tokens it may still generate - the
+    cells the slot already holds for this conversation) x KV_HOST_BYTES_PER_CELL. A request that does not fit is
+    never rejected or truncated: it waits in the slot loop until memory frees (the engine's fresh-start release
+    is what frees it) and is admitted then. Floor 0 disables the guard. One line is said when a request starts
+    waiting and one when it goes in."""
+
+    def __init__(self, floor_gib: float = 8.0, bytes_per_cell: int = KV_HOST_BYTES_PER_CELL, clock=time.monotonic,
+                 available=available_host_bytes):
+        self.floor_bytes = max(0.0, float(floor_gib)) * (1 << 30)
+        self.bytes_per_cell = int(bytes_per_cell)
+        self._clock = clock
+        self._available = available
+        self._held_since = None            # a request is being held since this clock reading (for the release line)
+        self._say = threading.Lock()       # several request threads share one guard; the two lines stay one each
+
+    @classmethod
+    def from_config(cls, cfg: dict) -> "MemoryGuard":
+        """The floor: the STRATA_MEMORY_GUARD_FLOOR_GIB env var over the config's "memory_guard_floor_gib" over
+        the 8 GiB default; 0 disables the guard. A value that is not a number is said and ignored."""
+        raw = os.environ.get("STRATA_MEMORY_GUARD_FLOOR_GIB")
+        if raw is None:
+            raw = cfg.get("memory_guard_floor_gib")
+            if raw is None:
+                return cls()
+        try:
+            return cls(floor_gib=float(raw))
+        except (TypeError, ValueError):
+            print(f'[strata] memory guard: "memory_guard_floor_gib" must be a number of GiB (0 disables), '
+                  f'not {raw!r}: the 8 GiB default applies', flush=True)
+            return cls()
+
+    def estimate_bytes(self, prompt_tokens: int, max_new_tokens: int, held_cells: int = 0) -> int:
+        """The host K/V the request can add: what it reads and generates, less the cells the slot's sessions
+        already hold for this conversation (a prefix of its prompt - the engine re-reads only the rest)."""
+        return max(0, int(prompt_tokens) + int(max_new_tokens) - int(held_cells)) * self.bytes_per_cell
+
+    def admits(self, available_bytes: int | None, estimate_bytes: int) -> bool:
+        """The rule itself: admit while free memory minus the estimate stays above the floor. Unknown free memory
+        admits (the metric being unreadable must not hold every request; the engine's own guard still decides
+        its side), and a disabled guard admits everything, exactly as before the guard existed."""
+        if self.floor_bytes <= 0:
+            return True
+        if available_bytes is None:
+            return True
+        return available_bytes - estimate_bytes >= self.floor_bytes
+
+    def check(self, prompt_tokens: int, max_new_tokens: int, held_cells: int = 0) -> bool:
+        """Read the memory, decide, and say the two lines: one when a request starts waiting on the guard, one
+        when it goes in. Safe to call every pass of the wait loop - a line is said only on a change."""
+        estimate = self.estimate_bytes(prompt_tokens, max_new_tokens, held_cells)
+        available = self._available()
+        ok = self.admits(available, estimate)
+        with self._say:
+            if not ok:
+                if self._held_since is None:
+                    self._held_since = self._clock()
+                    print(f"[strata] memory guard: holding a request: {available / (1 << 30):.1f} GiB free, "
+                          f"the request can add {estimate / (1 << 30):.1f} GiB of host K/V, the floor is "
+                          f"{self.floor_bytes / (1 << 30):.0f} GiB; it waits, never rejected", flush=True)
+            elif self._held_since is not None:
+                waited = self._clock() - self._held_since
+                self._held_since = None
+                free = "unknown" if available is None else f"{available / (1 << 30):.1f} GiB free"
+                print(f"[strata] memory guard: the request goes in after {waited:.0f} s ({free}, "
+                      f"estimate {estimate / (1 << 30):.1f} GiB, floor {self.floor_bytes / (1 << 30):.0f} GiB)",
+                      flush=True)
+        return ok
+
+
+# A bare engine (a test's) keeps today's behaviour: no guard. The server's own main() and start_replicas() set
+# the configured one on every engine they run, with the 8 GiB default of MemoryGuard.from_config.
+_DEFAULT_MEM_GUARD = MemoryGuard(floor_gib=0)
+
+
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
@@ -748,6 +875,7 @@ class StrataEngine:
     gpu_busy = None                      # #1317: () -> bool, "the GPU is working" (the telemetry's reading); a GPU at work is not frozen
     last_err = None                      # #997: an ERR that was its last stdout line (death_note says it)
     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
+    mem_guard = None                     # the memory guard (measurement-34); None: the disabled default (tests)
 
     # `last`: the figures of the engine's last DONE line.  With batch slots several requests run at once, each on its
     # own thread, so each one reads its own request's figures (Service.run records them); one at a time, the one dict.
@@ -1512,7 +1640,10 @@ class StrataEngine:
                     holding, born = True, self.gen                  # (the engine it now has the control lines of)
                 with self.slot_cv:
                     alone = not any(self.slot_busy) and self.waiting == 0
-                if alone and left > 1:
+                # the memory guard (measurement-34) reaches the solo path only when the same estimate says this
+                # request cannot fit: the main session's held cells are not known here, so the estimate is the
+                # whole request (the pessimistic end). Then it waits like any other, in the slot wait below.
+                if alone and left > 1 and self._memory_guard().check(len(prompt), left, 0):
                     head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
                     self._last_done = None                  # (#879: this request's DONE decides below)
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
@@ -1577,6 +1708,9 @@ class StrataEngine:
                         while True:
                             with self.slot_cv:
                                 slot = self.pick_slot(prompt)
+                                if slot is not None and self._memory_blocks_slot(prompt, left):
+                                    slot = None     # a free slot, but free host memory does not cover this request
+                                                    # yet (the memory guard, measurement-34): wait below, as before
                                 if slot is not None:
                                     self.slot_busy[slot] = True
                                     self.slot_claims.add(slot)
@@ -1591,18 +1725,22 @@ class StrataEngine:
                                 self.ctl.release()
                                 holding = False
                             with self.slot_cv:
-                                if self.pick_slot(prompt) is None:
+                                if self.pick_slot(prompt) is None or self._memory_blocks_slot(prompt, left):
                                     if (ENGINE_STALL_S or 0) > 0 and time.monotonic() - admit_since >= ENGINE_STALL_S:
                                         # the stall check of #1317 only watches a request on the control lines; one
                                         # waiting here is covered by looking for a slot nobody owns, and by saying so
                                         if not admit_said:
                                             admit_said = True
                                             busy = [b for b, v in enumerate(self.slot_busy) if v]
-                                            print(f"[strata] parallel: a request has waited {time.monotonic() - admit_since:.0f} s "
-                                                  f"for a free slot (busy: {busy}, in use: {sorted(self.slot_claims)}, "
-                                                  f"ending: {sorted(self.slot_releasing)}) (issue #1603)", flush=True)
+                                            why = ("the memory guard holds it" if self.pick_slot(prompt) is not None
+                                                   else "no free slot")
+                                            print(f"[strata] parallel: a request has waited "
+                                                  f"{time.monotonic() - admit_since:.0f} s "
+                                                  f"for admission ({why}; busy: {busy}, in use: "
+                                                  f"{sorted(self.slot_claims)}, ending: {sorted(self.slot_releasing)}) "
+                                                  f"(issue #1603)", flush=True)
                                     self._reap_orphan_slots()
-                                if self.pick_slot(prompt) is None:
+                                if self.pick_slot(prompt) is None or self._memory_blocks_slot(prompt, left):
                                     self.slot_cv.wait(timeout=1.0)
                             if cancel.is_set():
                                 return
@@ -1836,6 +1974,26 @@ class StrataEngine:
                 busy_in[self.slot_group[b]] = busy_in.get(self.slot_group[b], 0) + 1
         return min(free, key=lambda b: (busy_in.get(self.slot_group[b], 0) if self.slot_groups > 1 else 0,
                                         bool(self.slot_held[b]), self.slot_used[b]))
+
+    def _memory_guard(self) -> MemoryGuard:
+        """The engine's memory guard, or the disabled default of a bare engine (a test's): the server's main()
+        sets the configured floor on every engine it runs."""
+        return self.mem_guard or _DEFAULT_MEM_GUARD
+
+    def _memory_blocks_slot(self, prompt: list[int], left: int) -> bool:
+        """The memory guard (measurement-34), the admission side: True when a slot is free but the host K/V this
+        request can add (its prompt + what it may still generate, less the cells the chosen slot's sessions
+        already hold for this conversation, pick_slot's own prefix rule) does not leave the floor free. The
+        caller keeps the request in the slot wait, control lines given back, until memory frees - never a
+        rejection. False when a slot is free and memory covers it (and when no slot is free anyway: the plain
+        slot wait owns that case). The caller holds slot_cv."""
+        if self.pick_slot(prompt) is None:
+            return False
+        slot = self.pick_slot(prompt)
+        held, h = 0, self.slot_held[slot]
+        if h and len(h) < len(prompt) and prompt[:len(h)] == h:
+            held = len(h)          # the same credit pick_slot gives: the engine re-reads only the rest
+        return not self._memory_guard().check(len(prompt), left, held)
 
     def slots_view(self) -> list[dict]:
         """/metrics: each batch slot - idle (with the tokens it holds for a next turn), reading or decoding."""
@@ -6549,6 +6707,7 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
         try:
             engines[i] = StrataEngine(exe, engine_args(rc) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
                                       env=child_env(rc), lazy=lazy, cpus=cpus[i] if cpus else None)
+            engines[i].mem_guard = MemoryGuard.from_config(rc)   # measurement-34: the replica's own floor
         except BaseException as e:        # noqa: BLE001
             errors.append((i, e))
     rc0 = rp.replica_cfg(cfg, 0, groups[0])
@@ -6752,6 +6911,7 @@ def main() -> int:
         else:
             engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
                                   env=env, lazy=lazy)
+        engine.mem_guard = MemoryGuard.from_config(cfg)     # measurement-34: admission by free host memory
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
