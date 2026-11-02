@@ -17,6 +17,7 @@
 #define GGML_COMMON_IMPL_CUDA
 #include "ggml-common.h"
 
+#include <cstddef>
 #include <cstdio>
 #include <utility>
 #include <cstdlib>
@@ -1249,12 +1250,19 @@ bool g_stage_loads = [] {
 // instruction scatters over 18 sectors of two rows and the L1 pays a wavefront per sector touched.  Here the
 // block first copies its rows' bytes into shared memory with aligned vector loads - one coalesced sweep, the
 // same bytes - and every lane then reads its half-block's four code words and two scale bytes from shared as
-// 16-bit loads (every one of those offsets is even: codes at 18k + 4j, the scale pair at 18k + 32 or 18k + 16).
+// 16-bit loads (every one of those offsets is even; nvfp4_w_sm40 takes them from block_nvfp4's fields).
 // The words and scales are the same values the direct loads return, so W is bit for bit Split<40>::load's W
 // and every dot keeps its dp4a chain, its FP32 multiply order and its reduction tree.  STRATA_EXPERT_LOADS=0
 // keeps the direct loads everywhere (the A/B control arm).
+// Half-block k of a staged row is Split<40>::load(row, k >> 1, 4 * (k & 1)): block k >> 1, its sub-blocks 2h and
+// 2h + 1 (h = k & 1).  block_nvfp4 is d[4] then qs[32], so the four code words are qs bytes 16h .. 16h + 15 and
+// the scale pair is d[2h], d[2h + 1].  Both offsets come from the struct and every one is even (16-bit loads).
+static_assert(sizeof(block_nvfp4) == 36 && offsetof(block_nvfp4, d) % 2 == 0 && offsetof(block_nvfp4, qs) % 2 == 0,
+              "the staged NVFP4 reader assumes 36-byte blocks with even field offsets");
 __device__ __forceinline__ typename Split<40>::W nvfp4_w_sm40(const uint8_t* __restrict__ s_row, int k) {
-    const uint16_t* q16 = reinterpret_cast<const uint16_t*>(s_row + 18 * k);
+    const int h = k & 1;
+    const uint8_t* blk = s_row + sizeof(block_nvfp4) * (size_t) (k >> 1);
+    const uint16_t* q16 = reinterpret_cast<const uint16_t*>(blk + offsetof(block_nvfp4, qs) + 16 * h);
     int w[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) w[j] = (int) q16[2 * j] | ((int) q16[2 * j + 1] << 16);
@@ -1263,7 +1271,7 @@ __device__ __forceinline__ typename Split<40>::W nvfp4_w_sm40(const uint8_t* __r
     r.v1[0] = get_int_from_table_16(w[1], kvalues_fp4);
     r.v0[1] = get_int_from_table_16(w[2], kvalues_fp4);
     r.v1[1] = get_int_from_table_16(w[3], kvalues_fp4);
-    const unsigned sp = q16[9 * k + 16 - 8 * (k & 1)];   // d[2h], d[2h+1] as one 16-bit load
+    const unsigned sp = *reinterpret_cast<const uint16_t*>(blk + offsetof(block_nvfp4, d) + 2 * h);
     r.sc[0] = ue4m3_to_f32_half((uint8_t) (sp & 0xFF));
     r.sc[1] = ue4m3_to_f32_half((uint8_t) (sp >> 8));
     return r;
