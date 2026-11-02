@@ -122,10 +122,12 @@ int main(int argc, char** argv) {
             K::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, G, NE, dxq, dscr, dout, s);
         };
         std::vector<float> ref((size_t) NE * H), got((size_t) NE * H);
+        const bool ab = f.gu_type == 40 || f.d_type == 40;   // the shared-staged expert loads (2026-11-02)
         cudaMemsetAsync(dout, 0xff, got.size() * 4, s);
         run(mref, 0);
         cudaMemcpyAsync(ref.data(), dout, ref.size() * 4, cudaMemcpyDeviceToHost, s);
         cudaMemsetAsync(dout, 0xff, got.size() * 4, s);
+        K::iq_set_expert_loads(false);
         run(mode, 0);
         cudaMemcpyAsync(got.data(), dout, got.size() * 4, cudaMemcpyDeviceToHost, s);
         if (cudaStreamSynchronize(s) != cudaSuccess) { std::printf("layer %d: CUDA error\n", l); return 1; }
@@ -136,7 +138,19 @@ int main(int argc, char** argv) {
                 ++ndiff;
                 worst = std::fmax(worst, std::fabs((double) ref[i] - got[i]) / (std::fabs((double) ref[i]) + 1e-6));
             }
-        auto time = [&](int m, int phase) {
+        size_t ndiff_l = 0;
+        if (ab) {   // the same mode with the shared-staged weight loads: bitwise against the reference
+            cudaMemsetAsync(dout, 0xff, got.size() * 4, s);
+            K::iq_set_expert_loads(true);
+            run(mode, 0);
+            K::iq_set_expert_loads(false);
+            cudaMemcpyAsync(got.data(), dout, got.size() * 4, cudaMemcpyDeviceToHost, s);
+            if (cudaStreamSynchronize(s) != cudaSuccess) { std::printf("layer %d: CUDA error\n", l); return 1; }
+            for (size_t i = 0; i < ref.size(); ++i)
+                if (std::memcmp(&ref[i], &got[i], 4) != 0) ++ndiff_l;
+        }
+        auto time = [&](int m, int phase, bool loads) {
+            K::iq_set_expert_loads(loads);
             for (int i = 0; i < 10; ++i) run(m, phase);
             cudaEventRecord(e0, s);
             for (int i = 0; i < iters; ++i) run(m, phase);
@@ -147,18 +161,24 @@ int main(int argc, char** argv) {
             return 1e3 * ms / iters;
         };
         const double gu_b = (double) G * 2 * f.up_off, d_b = (double) G * dsz;
-        double us[2][3] = {{1e30, 1e30, 1e30}, {1e30, 1e30, 1e30}};
+        double us[3][3] = {{1e30, 1e30, 1e30}, {1e30, 1e30, 1e30}, {1e30, 1e30, 1e30}};
+        const int na = ab ? 3 : 2;   // 0: mref direct loads, 1: mode direct loads, 2: mode staged loads
         for (int round = 0; round < 3; ++round)   // interleaved, the minimum: the clocks wander between runs
-            for (int k = 0; k < 2; ++k)
-                for (int p = 0; p < 3; ++p) us[k][p] = std::fmin(us[k][p], time(k ? mode : mref, p));
+            for (int k = 0; k < na; ++k)
+                for (int p = 0; p < 3; ++p)
+                    us[k][p] = std::fmin(us[k][p], time(k == 0 ? mref : mode, p, k == 2));
         std::printf("layer %2d %-7s/%-6s G %d T %d | mode %d: all %7.1f us  gu %7.1f us (%3.0f GB/s)  down %6.1f us (%3.0f GB/s)"
-                    " | mode %d: all %7.1f us  gu %7.1f us (%3.0f GB/s)  down %6.1f us (%3.0f GB/s) | %s\n",
+                    " | mode %d: all %7.1f us  gu %7.1f us (%3.0f GB/s)  down %6.1f us (%3.0f GB/s)",
                     l, ggml_type_name((ggml_type) f.gu_type), ggml_type_name((ggml_type) f.d_type), G, T,
                     mref, us[0][0], us[0][1], gu_b / us[0][1] / 1e3, us[0][2], d_b / us[0][2] / 1e3,
-                    mode, us[1][0], us[1][1], gu_b / us[1][1] / 1e3, us[1][2], d_b / us[1][2] / 1e3,
-                    ndiff ? "DIFFERS" : "bitwise equal");
-        if (ndiff) {
-            std::printf("          %zu of %zu outputs differ, worst rel %.2e\n", ndiff, ref.size(), worst);
+                    mode, us[1][0], us[1][1], gu_b / us[1][1] / 1e3, us[1][2], d_b / us[1][2] / 1e3);
+        if (ab)
+            std::printf(" | loads on: all %7.1f us  gu %7.1f us (%3.0f GB/s)  down %6.1f us (%3.0f GB/s)",
+                        us[2][0], us[2][1], gu_b / us[2][1] / 1e3, us[2][2], d_b / us[2][2] / 1e3);
+        std::printf(" | %s\n", (ndiff || ndiff_l) ? "DIFFERS" : "bitwise equal");
+        if (ndiff || ndiff_l) {
+            std::printf("          %zu (+%zu staged) of %zu outputs differ, worst rel %.2e\n", ndiff, ndiff_l,
+                        ref.size(), worst);
             ++failures;
         }
         K::native_expert_set_mode(-1, 0);

@@ -58,6 +58,7 @@ const char* name_of(int t) {
         case 23: return "IQ4_XS";
         case 29: return "IQ1_M";
         case 42: return "Q2_0";
+        case 40: return "NVFP4";
         case 12: return "Q4_K";
         case 13: return "Q5_K";
         case 14: return "Q6_K";
@@ -75,6 +76,12 @@ std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& r
     std::uniform_int_distribution<int> byte(0, 255), ex(2, 8), man(0, 1023), sgn(0, 1);
     for (auto& b : w) b = (uint8_t) byte(rng);
     for (size_t o = 0; o < w.size(); o += bs) {
+        if (t == 40) {
+            // NVFP4: random bytes are valid codes, and its UE4M3 scales (block bytes 32..35) decode to a
+            // finite float for every byte (NaN maps to 0) - no fixup, the fp16 overwrite below would clobber
+            // code bytes
+            continue;
+        }
         if (t == 29) {
             // IQ1_M: the fp16 scale is the top nibbles of its four scale words (bytes 48..55), the sign and the
             // exponent's top bits in the last: 0x1 / 0x2 there (0x9 / 0xA negative) keeps it in 2^-11 .. 2^-3
@@ -120,6 +127,10 @@ struct Setup {
             auto blob = random_rows(gu, 2 * FF, H, rng);
             const auto down = random_rows(dt, H, FF, rng);
             blob.insert(blob.end(), down.begin(), down.end());
+            if (L.tail_off) {   // NVFP4's {s_gate, s_up, s_down, 0}: sane scales, not zeros the compare would
+                const float tail[4] = {8e-5f, 8e-5f, 1e-4f, 0.f};   // pass on any path that wrote nothing
+                blob.insert(blob.end(), (const uint8_t*) tail, (const uint8_t*) tail + 16);
+            }
             if (blob.size() != L.bytes) { std::fprintf(stderr, "blob %zu != %zu bytes\n", blob.size(), L.bytes); std::exit(2); }
             ck(cudaMemcpy(blobs + slot * (size_t) b, blob.data(), blob.size(), cudaMemcpyHostToDevice), "blob");
         }
@@ -228,6 +239,38 @@ void check(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& 
     std::printf("%-8s/%-7s %5lld x %4lld  %d calls: %s (%zu output floats written in all)\n", name_of(gu), name_of(dt),
                 (long long) H, (long long) FF, calls, bad ? "FAIL" : "bitwise equal to v1", written);
     if (written == 0) { std::printf("  nothing was written: the check checked nothing  FAIL\n"); ++bad; }
+    // STRATA_EXPERT_LOADS: the NVFP4 shared-staged weight loads against the direct ones, bitwise.  The staged
+    // branch needs xb == 80 (gate/up) or hb == 20 (down); every other pair takes the direct path with the flag
+    // either way, so only these shapes pay for the check.
+    if (gu == 40 || dt == 40) {
+        if ((gu == 40 && H == 2560) || (dt == 40 && FF == 640)) {
+            int scalls = 0, sbad = 0;
+            size_t swritten = 0;
+            for (const int base : {0, 7}) {
+                for (const int groups : {0, 1, 3, 8, 24}) {
+                    S.plan(groups, base, rng);
+                    const auto ref = S.result(true, 0, 0x00, s);   // the direct loads (the flag is off)
+                    for (const uint32_t v : ref) swritten += v != 0xFFFFFFFFu;
+                    k::iq_set_expert_loads(true);
+                    for (const int64_t gy : {(int64_t) 0, (int64_t) 3, (int64_t) S.cap + 3}) {
+                        const auto got = S.result(false, gy, (scalls & 1) ? 0x7F : 0x00, s);
+                        ++scalls;
+                        size_t diff = 0;
+                        for (size_t i = 0; i < ref.size(); ++i) diff += ref[i] != got[i];
+                        if (diff) {
+                            std::printf("  loads base %d, %d groups, grid_groups %lld: %zu of %zu floats differ  FAIL\n",
+                                        base, groups, (long long) gy, diff, ref.size());
+                            ++sbad;
+                        }
+                    }
+                    k::iq_set_expert_loads(false);
+                }
+            }
+            std::printf("  %-8s/%-7s expert loads (shared-staged) %d calls: %s (%zu floats written)\n", name_of(gu),
+                        name_of(dt), scalls, sbad ? "FAIL" : "bitwise equal to the direct loads", swritten);
+            bad += sbad;
+        }
+    }
     g_fail += bad;
 }
 
@@ -349,6 +392,7 @@ int main(int argc, char** argv) {
         for (int dt : {20, 23, 42, 7, 8}) check(gu, dt, 512, 256, s, rng);   // STRATA_D_FMTS; IQ4_XS: n_ff % 256
     check(21, 20, 2560, 640, s, rng);                                   // a model's shapes
     check(21, 23, 2560, 768, s, rng);
+    check(40, 40, 2560, 640, s, rng);                                   // NVFP4: the shared-staged load path
     if (do_bench) bench(s, rng);
     std::printf("native_grouped_parity: %d failures\n", g_fail);
     cudaStreamDestroy(s);

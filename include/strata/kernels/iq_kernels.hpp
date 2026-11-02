@@ -88,5 +88,11 @@ void native_expert_set_mode(int mode, int phase);
 /// bitwise the same results.  Set before graph capture; captured graphs keep the kernels they captured.
 void iq_set_old_kernels(bool old);
 bool iq_old_kernels();
+/// The NVFP4 grouped experts' weight loads: true (the default, STRATA_EXPERT_LOADS) stages each block's rows
+/// through shared memory with aligned vector loads and reads the half-blocks from there; false keeps the
+/// direct 4-byte loads.  Bitwise the same results.  Set before graph capture; captured graphs keep what they
+/// captured.
+void iq_set_expert_loads(bool on);
+bool iq_expert_loads();
 
 }  // namespace strata::kernels
