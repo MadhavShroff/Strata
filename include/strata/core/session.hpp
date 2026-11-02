@@ -104,8 +104,12 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
 /// rope kernels' registered angle table, #280), so a later session never rotates by freed memory.
 void session_release(SessionState& s);
 /// Zeroes every layer's state - the residual to `R_init`, everything else to zero, so a fresh sequence starts
-/// from the reference's own `zeros()`.
+/// from the reference's own `zeros()`.  With lazy host K/V copies it also gives their committed pages back to
+/// the OS (the memory guard, measurement-34): the sequence that ended was their last reader.
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream);
+/// The memory guard (measurement-34): what this session's lazy host K/V copies hold committed right now, summed
+/// over its owned QSA layers (0 with none - the pinned path has no such figure).
+uint64_t session_host_kv_committed(const SessionState& s);
 
 /// One token: layers 0..47 in order, each a `block_layer`, and the residual is updated in place.
 ///

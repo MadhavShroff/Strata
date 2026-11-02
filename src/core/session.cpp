@@ -185,6 +185,12 @@ void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, 
     s.ple_token = -1;
 }
 
+uint64_t session_host_kv_committed(const SessionState& s) {
+    uint64_t bytes = 0;
+    for (int64_t j = 0; j < s.qsa_alloc; ++j) bytes += qsa_state_host_committed(s.qsa_states[s.qsa_ord0 + j]);
+    return bytes;
+}
+
 /// Sets `s.gdn.state`/`conv_state` for `layer`, which is what makes one layer's GDN state its own.  Shared by
 /// the direct and captured paths so the two cannot disagree about which slice a layer owns.
 void gdn_point_at(const ModelGeometry& g, int64_t layer, SessionState& s) {

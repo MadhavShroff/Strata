@@ -241,6 +241,11 @@ struct QsaState {
     int32_t kv_elastic = -1;
     strata::kernels::KvHostPools host;
     strata::kernels::KvStreamMap map;
+    /// The memory guard (measurement-34). STRATA_KV_HOST_LAZY=1: `host` is an mmap(MAP_NORESERVE) region whose
+    /// pages commit as a conversation writes them; these name it so `qsa_state_zero` can give the pages of the
+    /// sequence that ended back to the OS. Nullptr/0: no host copy, or the pinned kind - never released.
+    uint8_t* host_lazy_base = nullptr;
+    uint64_t host_lazy_bytes = 0;
     int64_t idx_pooled_rows = 0;     ///< rows of `idx_pooled` (a ring, which has no indexer, keeps 2)
 
     float* idx_tail = nullptr;       ///< (idx_block - 1, idx_dim): the raw tail of the block being filled
@@ -333,7 +338,18 @@ void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* i
                     int64_t cap, void* stream);
 /// Zeroes the pools AND the indexer, so a fresh sequence matches the reference's own `zeros()`.  The KV pool
 /// matters even for cells that are never attended, because `kv_gather` reads whatever the selection names.
+/// With a lazy host copy it also drops that copy's committed pages (the memory guard, measurement-34): the
+/// sequence that ended was their last reader.
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream);
+/// The memory guard (measurement-34). `qsa_state_host_release` gives a lazy host copy's committed pages back to
+/// the OS (MADV_DONTNEED) and returns how many bytes that was - correct ONLY where the state's sequence has
+/// ended (a fresh `qsa_state_zero`, or a slot an admission is about to overwrite). It drains the device first:
+/// the region is device-mapped and a write still in flight would re-commit what this dropped. 0 when there is
+/// no lazy copy (the pinned path never changes). `qsa_state_host_committed` is what the lazy copy holds now,
+/// `kv_host_lazy_released_bytes` the process total released, both for the serve log.
+uint64_t qsa_state_host_release(const QsaState& st);
+uint64_t qsa_state_host_committed(const QsaState& st);
+uint64_t kv_host_lazy_released_bytes();
 
 // ================================ PER-STAGE TIMING, DEBUG ONLY ================================
 //

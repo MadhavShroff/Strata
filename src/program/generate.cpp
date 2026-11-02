@@ -9868,11 +9868,19 @@ int main(int argc, char** argv) {
         // the session a request just left behind (its prompt) -> slot b's sessions, on every stage
         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
+            const uint64_t kv_rel0 = strata::core::kv_host_lazy_released_bytes();
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 strata::core::SessionState& from = k == 0 ? ss : stages[k - 1]->ss;
                 strata::core::SessionState& to = *bslot_ss[k][(size_t) b];
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
+                // the memory guard (measurement-34): the slot's lazy host pages of the conversation it held are
+                // dead - the restore below rewrites [0, upto) and resets the stream map, which names nothing past
+                // it (the same invariant that already made those cells unreadable). Drop them before the rewrite
+                // re-commits what the new conversation needs, so the slot's RAM is this conversation's, not the
+                // deepest one it ever served.
+                for (int64_t j = 0; j < to.qsa_alloc; ++j)
+                    (void) strata::core::qsa_state_host_release(to.qsa_states[to.qsa_ord0 + j]);
                 strata::core::ConversationCheckpoint ck;
                 ck.ids = ids;
                 if (!strata::core::conversation_checkpoint_save(ck, from, g, e) ||
@@ -9902,6 +9910,14 @@ int main(int argc, char** argv) {
                     return false;
                 slot_mtp[(size_t) b]->set_prompt_len(upto);
             }
+            // the memory guard's own line (measurement-34): what this slot gave back at its fresh conversation,
+            // and what all its stages hold now - the slot's host RAM use, per admission
+            uint64_t held_now = 0;
+            for (size_t k = 0; k < bslot_ss.size(); ++k) held_now += strata::core::session_host_kv_committed(*bslot_ss[k][(size_t) b]);
+            std::fprintf(stderr, "strata serve: kv host: slot %d's fresh conversation gave back %.1f MiB; the slot's "
+                                 "lazy host K/V holds %.1f MiB\n", b,
+                         (double) (strata::core::kv_host_lazy_released_bytes() - kv_rel0) / 1048576.0,
+                         (double) held_now / 1048576.0);
             return true;
         };
         // slot b's sessions -> the main ones (the reverse of copy_to_slot): a request that continues the
@@ -11155,6 +11171,7 @@ int main(int argc, char** argv) {
             }
             int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
             if (resume == 0) {
+                const uint64_t kv_rel0 = strata::core::kv_host_lazy_released_bytes();
                 strata::core::session_zero(ss, g, nullptr, main_cs);
                 cudaStreamSynchronize(main_stream);
                 for (auto& st : stages) {
@@ -11163,6 +11180,13 @@ int main(int argc, char** argv) {
                     cudaStreamSynchronize(st->stream);
                 }
                 checks.clear();
+                // the memory guard (measurement-34): session_zero above gave the lazy host K/V pages of the
+                // conversation that ended back to the OS; say how much, and what this session holds now, so a
+                // session's host RAM use is visible at every fresh start (a resume prints nothing: it keeps cells)
+                std::fprintf(stderr, "strata serve: kv host: a fresh start gave back %.1f MiB; this session's lazy "
+                                     "host K/V holds %.1f MiB\n",
+                             (double) (strata::core::kv_host_lazy_released_bytes() - kv_rel0) / 1048576.0,
+                             (double) strata::core::session_host_kv_committed(ss) / 1048576.0);
             } else if (!from_live) {
                 ConvCheckpoint* c = nullptr;
                 for (ConvCheckpoint& k : checks) if ((int64_t) k.ids.size() == resume) c = &k;

@@ -566,6 +566,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     set_tests_properties(memory_guard_test PROPERTIES TIMEOUT 60)
   endif()
 
+  # the memory guard (measurement-34): the lazy host K/V pages a fresh start gives back - the release mechanism
+  # of qsa_state_host_release, on a region mapped the way layer.cpp maps it under STRATA_KV_HOST_LAZY=1
+  if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/kv_host_release_test.cpp")
+    add_executable(kv_host_release_test tests/core/kv_host_release_test.cpp)
+    target_include_directories(kv_host_release_test PRIVATE include)
+    target_link_libraries(kv_host_release_test PRIVATE strata_engine)
+    add_test(NAME kv_host_release_test COMMAND kv_host_release_test)
+    set_tests_properties(kv_host_release_test PROPERTIES TIMEOUT 60)
+  endif()
+
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/file_expert_source_test.cpp")
     enable_testing()
     add_executable(file_expert_source_test tests/core/file_expert_source_test.cpp)

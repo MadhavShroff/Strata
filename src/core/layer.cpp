@@ -32,6 +32,8 @@
 #include "strata/kernels/fused_gdn.hpp"
 #include "strata/kernels/qsa_select.hpp"
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <cstdlib>
 #include <exception>
 #include <cuda_runtime.h>
@@ -517,6 +519,7 @@ namespace {
 int64_t g_kv_resident = 0;
 uint64_t g_kv_host_bytes = 0;
 uint64_t g_kv_host_lazy_bytes = 0;   // the part of g_kv_host_bytes reserved, not pinned (STRATA_KV_HOST_LAZY=1)
+std::atomic<uint64_t> g_kv_host_released_bytes{0};   // the memory guard's running total (measurement-34)
 
 // STRATA_KV_HOST_LAZY=1 (opt-in): the streamed K/V's host copy in reserved pageable memory instead of pinned RAM.
 // Only where the GPU reads pageable memory through the host page tables (cudaDevAttrPageableMemoryAccessUsesHost-
@@ -841,6 +844,8 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
             }
             (void) madvise(m, bytes, MADV_HUGEPAGE);   // fewer GPU faults on first write (53 us vs 367 us mean)
             h = d = (uint8_t*) m;
+            st.host_lazy_base = (uint8_t*) m;   // the memory guard (measurement-34) releases these pages at a
+            st.host_lazy_bytes = bytes;         // fresh start; the pinned kind below stays nullptr, untouched
             g_kv_host_lazy_bytes += bytes;   // (also in g_kv_host_bytes below: the host copy's size either way)
         } else if (cudaHostAlloc((void**) &h, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
                    cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess) {
@@ -928,7 +933,43 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     cudaMemsetAsync(st.idx_tail, 0, (size_t) (s.idx_block - 1) * s.idx_dim * 4, cs);
     cudaMemsetAsync(st.idx_dead, 0, (size_t) s.idx_dim * 4, cs);
     cudaMemsetAsync(st.idx_pooled, 0, (size_t) st.idx_pooled_rows * s.idx_dim * 4, cs);
+    // THE MEMORY GUARD (measurement-34): the lazy host copy's cells are dead with the sequence that ended - the
+    // reset above names no block before this sequence writes it, the same invariant that lets the copy go
+    // unzeroed above. Give its committed pages back to the OS, so a slot's RAM no longer grows to the deepest
+    // context it ever served. A resume never comes through here: it restores or keeps cells instead of zeroing.
+    (void) qsa_state_host_release(st);
 }
+
+// What of a lazy region is committed right now: its resident 4 KiB pages. mincore, not RSS - MADV_DONTNEED's
+// effect is the whole point of the figure. 0 when it cannot be read: say nothing rather than a wrong number.
+static uint64_t kv_host_resident_bytes(const void* base, uint64_t bytes) {
+    constexpr uint64_t kPage = 4096;
+    const size_t pages = (size_t) ((bytes + kPage - 1) / kPage);
+    std::vector<unsigned char> vec(pages);
+    while (mincore(const_cast<void*>(base), bytes, vec.data()) != 0) {
+        if (errno != EAGAIN) return 0;
+    }
+    uint64_t resident = 0;
+    for (const unsigned char c : vec) resident += (c & 1) != 0;
+    return resident * kPage;
+}
+
+uint64_t qsa_state_host_release(const QsaState& st) {
+    if (st.host_lazy_bytes == 0) return 0;   // no host copy, or the pinned kind: the pinned path never changes
+    // The region is device-mapped: every writer (a window's fill/eviction, a restore) runs on a CUDA stream, so
+    // the device is drained before the pages drop - a write still in flight would re-commit what this freed.
+    cudaDeviceSynchronize();
+    const uint64_t was = kv_host_resident_bytes(st.host_lazy_base, st.host_lazy_bytes);
+    if (madvise(st.host_lazy_base, st.host_lazy_bytes, MADV_DONTNEED) != 0) return 0;
+    g_kv_host_released_bytes += was;
+    return was;
+}
+
+uint64_t qsa_state_host_committed(const QsaState& st) {
+    return st.host_lazy_bytes == 0 ? 0 : kv_host_resident_bytes(st.host_lazy_base, st.host_lazy_bytes);
+}
+
+uint64_t kv_host_lazy_released_bytes() { return g_kv_host_released_bytes.load(); }
 
 strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st) {
     strata::kernels::QsaAttnPools pools;
