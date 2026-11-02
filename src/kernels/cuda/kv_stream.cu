@@ -221,7 +221,7 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
     }
     // one sweep step looks at RT consecutive slots `(hand + thread) % n_slots`; with fewer slots than RT two
     // threads see the same slot and may both take it for two different misses.  The engine never streams with fewer
-    // than qsa_kv_resident_min() / page_size = 5,120 slots, so this is a guard, not a limit.
+    // than qsa_kv_resident_min() / page_size = 7,680 slots, so this is a guard, not a limit.
     if (m.n_slots < RT) {
         std::fprintf(stderr, "kv_stream: %lld slots is fewer than the resolve block (%d): the clock sweep would take a "
                              "slot twice\n", (long long) m.n_slots, RT);

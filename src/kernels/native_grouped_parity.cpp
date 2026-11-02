@@ -201,8 +201,8 @@ struct Setup {
     }
 };
 
-void check(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& rng) {
-    Setup S(gu, dt, H, FF, 6, 4, 9, rng, s);   // 6 tokens x 4 experts: cap 24 entries
+void check(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& rng, int tokens = 6) {
+    Setup S(gu, dt, H, FF, tokens, 4, 9, rng, s);   // `tokens` tokens x 4 experts: cap 4 x tokens entries
     int calls = 0, bad = 0;
     size_t written = 0;
     for (const int base : {0, 7}) {
@@ -349,6 +349,7 @@ int main(int argc, char** argv) {
         for (int dt : {20, 23, 42, 7, 8}) check(gu, dt, 512, 256, s, rng);   // STRATA_D_FMTS; IQ4_XS: n_ff % 256
     check(21, 20, 2560, 640, s, rng);                                   // a model's shapes
     check(21, 23, 2560, 768, s, rng);
+    check(21, 20, 2560, 640, s, rng, 12);                              // a 12-row verify window: cap 48 entries
     if (do_bench) bench(s, rng);
     std::printf("native_grouped_parity: %d failures\n", g_fail);
     cudaStreamDestroy(s);

@@ -10,6 +10,7 @@
 // spec_sample.  Every out[t] must match, accepted or not.  Needs a GPU.
 #include "strata/core/spec_prob.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 
@@ -124,8 +125,8 @@ int main(int argc, char** argv) {
     std::mt19937_64 g(777);
     long long rows = 0, accepted = 0, rejected = 0, plain = 0, bad = 0, qrows_total = 0;
     const int vocabs[] = {1000, 50000, 248320};
-    const int Ts[] = {2, 3, 5, 8};
-    const int kMaxT = 8;
+    const int Ts[] = {2, 3, 5, 8, 12};
+    const int kMaxT = strata::kernels::kVerifyMaxT;
     float* d_logits = nullptr;
     int* d_out = nullptr;
     int32_t* d_hist = nullptr;

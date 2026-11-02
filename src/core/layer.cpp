@@ -31,6 +31,7 @@
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/fused_gdn.hpp"
 #include "strata/kernels/qsa_select.hpp"
+#include "strata/kernels/verify_kernels.hpp"   // kVerifyMaxT: the KV floor below
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -691,7 +692,13 @@ uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages, bool hybrid, bool int8
 
 void qsa_set_kv_resident(int64_t cells) { g_kv_resident = cells > 0 ? cells : 0; }
 int64_t qsa_kv_resident() { return g_kv_resident; }
-int64_t qsa_kv_resident_min() { return 20480; }
+// The floor that keeps resolve_kernel's overflow branch unreachable: one verify window of kVerifyMaxT rows
+// selects up to idx_top_k cells per QSA layer each, all of them resident at once (a row's selection is disjoint
+// from another's in the worst case).  kVerifyMaxT x kCompiledGeometry.idx_top_k, plus the 1.25 headroom the
+// 8-row floor carried (20,480 / 16,384 = 1.25): 12 x 2,048 x 1.25 = 30,720 cells = 7,680 pages of 4.
+int64_t qsa_kv_resident_min() {
+    return (int64_t) strata::kernels::kVerifyMaxT * strata::core::kCompiledGeometry.idx_top_k * 5 / 4;
+}
 uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
 uint64_t qsa_kv_host_lazy_bytes() { return g_kv_host_lazy_bytes; }
 
