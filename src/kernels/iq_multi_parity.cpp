@@ -117,7 +117,7 @@ void check_mmvq(int t, int n_in, int n_out, cudaStream_t s, std::mt19937& rng) {
     k::iq_dequant_f32(t, dw, (int64_t) n_out * n_in, dwf, s);
     std::vector<float> wf((size_t) n_out * n_in);
     ck(cudaMemcpy(wf.data(), dwf, wf.size() * 4, cudaMemcpyDeviceToHost), "wf");
-    const int max_cols = 11;
+    const int max_cols = k::kVerifyMaxT;   // every column the loop below checks has its activations and outputs
     const auto x = random_x((size_t) max_cols * n_in, rng);
     float* dx = dalloc<float>(x.size());
     ck(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
@@ -294,12 +294,13 @@ void bench(cudaStream_t s, std::mt19937& rng) {
         const auto w = random_rows(t, n_out, n_in, rng);
         uint8_t* dw = dalloc<uint8_t>(w.size());
         ck(cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice), "w");
-        const auto x = random_x((size_t) 8 * n_in, rng);
+        const int mc = k::kVerifyMaxT;   // the timing loop below runs ncols 1..kVerifyMaxT
+        const auto x = random_x((size_t) mc * n_in, rng);
         float* dx = dalloc<float>(x.size());
         ck(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
-        uint8_t* dxq = dalloc<uint8_t>((size_t) 8 * (n_in / 32) * 36);
-        k::quantize_q8_1_rows(dx, 8, n_in, dxq, s);
-        float* dy = dalloc<float>((size_t) 8 * n_out);
+        uint8_t* dxq = dalloc<uint8_t>((size_t) mc * (n_in / 32) * 36);
+        k::quantize_q8_1_rows(dx, mc, n_in, dxq, s);
+        float* dy = dalloc<float>((size_t) mc * n_out);
         std::printf("%-8s iq_mmvq %d x %d:", name_of(t), n_out, n_in);
         for (int nc = 1; nc <= k::kVerifyMaxT; ++nc) {
             float us[2];
