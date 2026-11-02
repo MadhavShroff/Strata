@@ -53,7 +53,9 @@ uint64_t resident_pages(const void* base, uint64_t bytes) {
 int main() {
     const uint64_t bytes = 64 * kPage;   // 64 pages: small, but the same page semantics as the GiB regions
 
-    // 1. A conversation wrote every other page; a fresh start releases exactly what it wrote.
+    // 1. A conversation wrote every other page; a fresh start releases exactly what was committed. This box runs
+    //    transparent huge pages [always], so a write to every other 4 KiB page can commit the whole region -
+    //    the check is that the release returns the counted bytes, whatever THP committed.
     {
         uint8_t* m = map_region(bytes);
         for (uint64_t off = 0; off < bytes; off += 2 * kPage) m[off] = 0x5a;
@@ -61,15 +63,15 @@ int main() {
         st.host_lazy_base = m;
         st.host_lazy_bytes = bytes;
         const uint64_t before = resident_pages(m, bytes);
-        check(before == 32, "half the region is committed after the writes");
+        check(before >= 32 && before <= 64, "at least the written pages are committed after the writes");
         const uint64_t total0 = strata::core::kv_host_lazy_released_bytes();
         const uint64_t released = strata::core::qsa_state_host_release(st);
         check(released == before * kPage, "the release reports exactly the resident bytes");
         check(strata::core::kv_host_lazy_released_bytes() == total0 + released, "the running total counts it");
         check(resident_pages(m, bytes) == 0, "nothing stays committed after the release");
-        check(m[0] == 0 && m[2 * kPage] == 0, "a read after the release sees zeros (a fresh sequence's unwritten cells)");
-        // 2. Releasing again gives nothing back: the release is a fresh start's, not a repeated one.
+        // 2. Releasing again gives nothing back (checked BEFORE any read: a read re-commits its page).
         check(strata::core::qsa_state_host_release(st) == 0, "a second release releases nothing");
+        check(m[0] == 0 && m[2 * kPage] == 0, "a read after the release sees zeros (a fresh sequence's unwritten cells)");
         munmap(m, bytes);
     }
 
