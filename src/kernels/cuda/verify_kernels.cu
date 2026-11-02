@@ -267,6 +267,31 @@ __device__ __forceinline__ void gdn_step_commit_body(float* __restrict__ state, 
 // S26 (STRATA_QFUSE=1): the q8_1 image of a 32-column block, written by the warp that holds those columns with
 // native_quantize_q8_1_kernel's quantizer (the same XOR-tree max and sum, d = amax / 127, roundf(x / d), ds = (d, sum)).
 struct GdnQ81 { half2 ds; int8_t qs[32]; };
+#if !defined(__HIPCC__)
+// CUDA: native_mmvq.cu (the separate quantizer) is built with --use_fast_math and this file is not, so the same source
+// rounds differently: there amax / 127 is a multiply by 1/127 and xi / d an approximate reciprocal, both flushing
+// subnormals; here both are IEEE divisions. On GB10 (sm_121) that changed 788,203 of 8,388,608 q8_1 values and 9,962
+// block sums of 262,144 blocks, and a greedy decode under STRATA_QFUSE=1 left the STRATA_QFUSE=0 text after ~600 chars.
+// So the store writes the fast-math operations out (nvcc also ignores the clang pragma below in device code): bit
+// equal to native_quantize_q8_1_kernel on all 262,144 harness blocks (random, outlier, tie, single, zero, subnormal).
+__device__ __forceinline__ float gdn_q8_ftz(float v) { return fabsf(v) < 1.17549435e-38f ? copysignf(0.0f, v) : v; }
+__device__ __forceinline__ void gdn_q8_1_store(GdnQ81* __restrict__ xq, size_t idx, float xi) {
+    xi = gdn_q8_ftz(xi);
+    float amax = fabsf(xi), sum = xi;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) sum = gdn_q8_ftz(__fadd_rn(sum, __shfl_xor_sync(0xffffffffu, sum, o)));
+    const float d = q8_1_finite(gdn_q8_ftz(__fmul_rn(amax, 0.0078740157186985015869f)));
+    int8_t q = 0;
+    if (amax != 0.0f) {
+        const float r = roundf(__fdividef(xi, d));
+        q = (int8_t) (r > 127.0f ? 127.0f : r < -127.0f ? -127.0f : r);
+    }
+    xq[idx / 32].qs[idx % 32] = q;
+    if (idx % 32 == 0) xq[idx / 32].ds = q8_1_ds(d, sum);
+}
+#else
 __device__ __forceinline__ void gdn_q8_1_store(GdnQ81* __restrict__ xq, size_t idx, float xi) {
     // no contraction: xi is a product here, and fma(a, b, shfl) would round the first sum unlike the separate
     // quantizer, which reads xi from memory (S26 harness: ds.sum differed by 1 ulp without this)
@@ -281,6 +306,7 @@ __device__ __forceinline__ void gdn_q8_1_store(GdnQ81* __restrict__ xq, size_t i
     xq[idx / 32].qs[idx % 32] = q;
     if (idx % 32 == 0) xq[idx / 32].ds = q8_1_ds(d, sum);   // #606: clamped (the QFUSE path bypassed the finite helper)
 }
+#endif
 
 template <bool ALL_OUT, bool Q>
 __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __restrict__ state,
