@@ -99,8 +99,15 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < got.size(); ++i) { num += (got[i] - ref[i]) * (got[i] - ref[i]); den += ref[i] * ref[i]; }
         const double rel = std::sqrt(num / den);
         worst = std::fmax(worst, rel);
-        std::printf("layer %2d expert %3d: s_gate %.3g s_up %.3g s_down %.3g -> expert output rel. error %.3f%%\n", layer,
-                    e, tail[0], tail[1], tail[2], 100 * rel);
+        // the output's bits as FNV-1a 64: two runs that differ only in a bitwise-neutral switch (STRATA_EXPERT_LOADS)
+        // must print the same hash; the rel. error above cannot tell a 1-ulp difference
+        uint64_t h = 1469598103934665603ull;
+        for (const float v : got) {
+            uint32_t b; std::memcpy(&b, &v, 4);
+            for (int i = 0; i < 4; ++i) { h ^= (b >> (8 * i)) & 0xFF; h *= 1099511628211ull; }
+        }
+        std::printf("layer %2d expert %3d: s_gate %.3g s_up %.3g s_down %.3g -> expert output rel. error %.3f%%, "
+                    "bits %016llx\n", layer, e, tail[0], tail[1], tail[2], 100 * rel, (unsigned long long) h);
     }
     std::printf("RESULT: %s (worst %.3f%%)\n", worst < 0.03 ? "ok" : "TOO FAR", 100 * worst);
     return worst < 0.03 ? 0 : 1;
