@@ -1044,6 +1044,10 @@ struct Engine {
     float* hlast = nullptr;   // [N] that of the last processed position (zeros before the first)
     void *q8, *xq, *escr;
     int32_t *ids, *grp_start, *n_groups, *ent_dst, *ent_tok, *tok, *pos0, *pick;
+    // The grouped launch's grid y: the distinct experts in the last batch, so the number of expert blobs one
+    // launch reads.  The nsys trace records the grid but not this count, so a bytes-per-call bandwidth reading
+    // had no denominator.  Read back once per request (one 4-byte copy), not per layer.
+    int32_t groups_last = 0;
     int32_t* hpin = nullptr;   // pinned staging: [0] decode token, [1] position, [2..9] picks, [10] max rows, [16..] tokens
     unsigned long long* grp_ptr;
     float *pacc, *pm, *pl, *amv;
@@ -1917,6 +1921,10 @@ struct Engine {
 
     int greedy() {
         CK(cudaMemcpyAsync(hpin + 2, pick, 4, cudaMemcpyDeviceToHost, st));
+        // the grouped launch's grid y from the step just run: one 4-byte copy on the same stream, so it costs
+        // nothing extra.  A step that took the MMQ path leaves the previous value; that path is not the one the
+        // bandwidth question is about.
+        CK(cudaMemcpyAsync(&groups_last, n_groups, 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
         return hpin[2];
     }
@@ -2535,8 +2543,9 @@ int strata::qwen35::run(int argc, char** argv) {
     std::printf("gen:");
     for (int t : gen) std::printf(" %d", t);
     std::printf("\n");
-    std::fprintf(stderr, "strata-q36: prompt %zu tokens in %.1f ms (%.1f tok/s), %zu generated in %.1f ms (%.1f tok/s)\n",
+    std::fprintf(stderr, "strata-q36: prompt %zu tokens in %.1f ms (%.1f tok/s), %zu generated in %.1f ms (%.1f tok/s), "
+                 "grouped experts %d distinct in the last batch (the grouped launch's grid y)\n",
                  prompt.size(), pp_ms, prompt.size() / (pp_ms / 1000.0), gen.size(), ms_since(t1),
-                 gen.size() / (ms_since(t1) / 1000.0));
+                 gen.size() / (ms_since(t1) / 1000.0), (int) E.groups_last);
     return 0;
 }
