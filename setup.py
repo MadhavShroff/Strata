@@ -877,11 +877,23 @@ def cpu_info():
     else:
         try:
             txt = open("/proc/cpuinfo").read()
-            flags = set(re.search(r"^flags\s*:\s*(.*)$", txt, re.M).group(1).split())
+            # An ARM64 /proc/cpuinfo has no "flags" line (its is "Features") and no "model name": the two
+            # re.search calls below returned None and setup stopped with an AttributeError.  avx2 / avx512 are
+            # x86 feature names, so they stay False on such a CPU and the engine's own probes agree
+            # (cpu_avx2_ok() / cpu_avx512_ok() read CPUID, which AArch64 does not have).
+            fm = re.search(r"^flags\s*:\s*(.*)$", txt, re.M)
+            flags = set(fm.group(1).split()) if fm else set()
             avx2 = "avx2" in flags
             avx512 = {"avx512f", "avx512bw", "avx512vl", "avx512_vnni", "avx512vbmi"} <= flags
             m = re.search(r"^model name\s*:\s*(.*)$", txt, re.M)
-            name = m.group(1) if m else name
+            if m is None:                       # ARM64: name the part, so the report is not "unknown CPU"
+                part = re.search(r"^CPU part\s*:\s*(.*)$", txt, re.M)
+                impl = re.search(r"^CPU implementer\s*:\s*(.*)$", txt, re.M)
+                if part is not None:
+                    name = f"{platform.machine()} (CPU part {part.group(1).strip()}" + \
+                           (f", implementer {impl.group(1).strip()})" if impl else ")")
+            else:
+                name = m.group(1)
         except OSError:
             pass
     return name, avx2, avx512
@@ -916,6 +928,12 @@ def cpu_floor(avx2: bool) -> str:
     if forced in ("avx", "none"):
         return forced
     if avx2:
+        return ""
+    # Not an x86 CPU at all (ARM64: the DGX Spark's Grace, an Apple Mac, a Graviton).  "avx2" and "sse4.2" are x86
+    # feature names and this PC has neither, but it is not an OLD x86 CPU either: the ISA_FLOOR builds do not apply.
+    # The engine's CPU kernels are compiled through the SIMDe translation layer (STRATA_X86_COMPAT) and ggml-cpu is
+    # built for this machine's own NEON, so "" - the normal engine for this PC - is the right answer.
+    if platform.machine().lower() in ("aarch64", "arm64", "armv8l", "armv8b"):
         return ""
     if WIN:
         f = _cpuid_floor()
@@ -991,18 +1009,49 @@ def _cpuid_avx2() -> bool:
         return False
 
 
+NVIDIA_UMA_RESERVE_GB = 8.0   # of a unified-memory NVIDIA box's RAM, the share setup does not count as GPU memory
+
+
+def nvidia_uma_name(name: str) -> bool:
+    """An NVIDIA board whose "VRAM" is the system's own RAM: the GB10 of the DGX Spark and the boards that carry it
+    (Grace Blackwell on one package, LPDDR5X shared by the CPU and the GPU).  nvidia-smi answers "[N/A]" for
+    memory.total on these, which is what made `gpus()` drop the card entirely before 0.1.44.1 (every line raised
+    ValueError on float("[N/A]") and the list came back empty: "no NVIDIA GPU found").  The engine already treats
+    such a device as unified memory - `device_free_bytes()` counts MemAvailable per device through
+    cudaDevAttrIntegrated, following NVIDIA's DGX Spark Porting Guide section 5.5."""
+    n = (name or "").upper()
+    return "GB10" in n or "DGX SPARK" in n
+
+
 def gpus():
     """Every NVIDIA GPU, numbered as nvidia-smi numbers them (by PCI bus, the order the engine is told to use)."""
     s = out(["nvidia-smi", "--query-gpu=index,name,memory.total,compute_cap,driver_version",
              "--format=csv,noheader,nounits"])
     found = []
     for line in s.strip().splitlines():
+        parts = [x.strip() for x in line.split(",")]
+        if len(parts) != 5:
+            continue
+        idx, name, mem, cc, drv = parts
         try:
-            idx, name, mem, cc, drv = [x.strip() for x in line.split(",")]
-            found.append({"index": int(idx), "name": name, "vram_gb": float(mem) / 1024.0, "arch": cc.replace(".", ""),
-                          "driver": drv})
+            vram = float(mem) / 1024.0
+            uma = False
+        except ValueError:
+            # A unified-memory NVIDIA board reports no memory.total.  Count the RAM the OS can give back, less a
+            # reserve, exactly as the engine's own device_free_bytes() does - not zero, and never a dropped card.
+            if not nvidia_uma_name(name):
+                continue
+            vram = max(0.0, ram_gb() - NVIDIA_UMA_RESERVE_GB)
+            uma = True
+        try:
+            entry = {"index": int(idx), "name": name, "vram_gb": vram, "arch": cc.replace(".", ""), "driver": drv}
         except ValueError:
             continue
+        if uma:
+            # The same keys amd_apply_uma() sets, so every text and sizing path that already knows unified memory
+            # (amd_mem_text, low_ram_vram, uma_expert_cache) reads this card correctly too.
+            entry.update({"uma": True, "dedicated_gb": vram, "shared_gb": 0.0})
+        found.append(entry)
     return found
 
 

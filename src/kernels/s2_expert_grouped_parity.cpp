@@ -529,7 +529,11 @@ void bench() {
     cudaDeviceProp prop{};
     ck(cudaGetDevice(&dev), "dev");
     ck(cudaGetDeviceProperties(&prop, dev), "props");
-    const int nb = std::max(48, (int) (3ull * (size_t) prop.l2CacheSize / BLOB) + 8);
+    int nb = std::max(48, (int) (3ull * (size_t) prop.l2CacheSize / BLOB) + 8);
+    if (const char* e = std::getenv("STRATA_BENCH_BLOBS")) {   // cold-cache A/B: a set far past the L2
+        int v = std::atoi(e);
+        if (v >= 16) nb = v;
+    }
     std::printf("bench: %s, L2 %d MB, %d blobs (%.0f MB) cycled\n", prop.name, prop.l2CacheSize >> 20, nb,
                 nb * (double) BLOB / 1e6);
     std::mt19937 rng(7);

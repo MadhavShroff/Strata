@@ -37,6 +37,7 @@
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cstdio>
+#include <sys/mman.h>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -515,6 +516,30 @@ namespace {
 // KV streaming (docs/kv-streaming-design.md): 0 keeps every cell in VRAM.
 int64_t g_kv_resident = 0;
 uint64_t g_kv_host_bytes = 0;
+uint64_t g_kv_host_lazy_bytes = 0;   // the part of g_kv_host_bytes reserved, not pinned (STRATA_KV_HOST_LAZY=1)
+
+// STRATA_KV_HOST_LAZY=1 (opt-in): the streamed K/V's host copy in reserved pageable memory instead of pinned RAM.
+// Only where the GPU reads pageable memory through the host page tables (cudaDevAttrPageableMemoryAccessUsesHost-
+// PageTables, e.g. GB10); anywhere else the setting is refused once and the copy is pinned as before.
+bool kv_host_lazy() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_KV_HOST_LAZY");
+        if (v == nullptr || v[0] == '\0' || v[0] == '0') return false;
+        int dev = 0, pageable = 0, host_tables = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess, dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&host_tables, cudaDevAttrPageableMemoryAccessUsesHostPageTables, dev) != cudaSuccess ||
+            !pageable || !host_tables) {
+            std::fprintf(stderr, "strata: STRATA_KV_HOST_LAZY=1 needs a GPU that reads pageable memory through the host "
+                                 "page tables; the K/V's host copy is pinned\n");
+            return false;
+        }
+        std::fprintf(stderr, "strata: KV streaming: the host copy of the K/V is reserved, not pinned "
+                             "(STRATA_KV_HOST_LAZY=1); a page takes RAM when a cell in it is written\n");
+        return true;
+    }();
+    return on;
+}
 
 // ---- the elastic K/V (--kv-grow): one VMM range per state, each pool array at a chunk boundary in it
 bool g_kv_elastic = false;
@@ -665,6 +690,7 @@ void qsa_set_kv_resident(int64_t cells) { g_kv_resident = cells > 0 ? cells : 0;
 int64_t qsa_kv_resident() { return g_kv_resident; }
 int64_t qsa_kv_resident_min() { return 20480; }
 uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
+uint64_t qsa_kv_host_lazy_bytes() { return g_kv_host_lazy_bytes; }
 
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
     const QsaShapes s = qsa_shapes(g);
@@ -802,8 +828,22 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         const uint64_t bytes = (uint64_t) pages * strata::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
         uint8_t* h = nullptr;
         uint8_t* d = nullptr;
-        if (cudaHostAlloc((void**) &h, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
-            cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess) {
+        if (kv_host_lazy()) {
+            // STRATA_KV_HOST_LAZY=1: the host copy is reserved, not committed. On a GPU that reads pageable memory
+            // through the host page tables (GB10) the device writes and reads it directly; a page takes RAM only
+            // when a cell in it is written. Pinning every cell of a 1M context took 12.38 GiB per session at
+            // start, before the expert cache was sized - the cache then held what was left.
+            void* m = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+            if (m == MAP_FAILED) {
+                std::fprintf(stderr, "strata: KV streaming: cannot reserve %.2f GiB for a layer's KV copy\n",
+                             (double) bytes / 1073741824.0);
+                return 0;
+            }
+            (void) madvise(m, bytes, MADV_HUGEPAGE);   // fewer GPU faults on first write (53 us vs 367 us mean)
+            h = d = (uint8_t*) m;
+            g_kv_host_lazy_bytes += bytes;   // (also in g_kv_host_bytes below: the host copy's size either way)
+        } else if (cudaHostAlloc((void**) &h, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                   cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess) {
             // under WSL the NVIDIA driver pins only ~1 GiB in all, which is less than 128K of 8-bit KV needs
             if (p.mode == 1) std::fprintf(stderr, "strata: KV streaming: cannot pin %.2f GiB of RAM for a layer's KV copy "
                                  "(%.2f GiB pinned so far) - lower the context, or run without --kv-resident (under "

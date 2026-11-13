@@ -22,11 +22,16 @@
 
 // `_mm_pause` for the doorbell spin.  Guarded because it is x86-only; a target without it still builds, the
 // spin is just less polite to the pipeline.
-#if defined(_MSC_VER) || defined(__x86_64__) || defined(__i386__)
+// STRATA_X86_COMPAT (the aarch64 port): compat/immintrin.h supplies both _mm_pause and _mm_sfence.
+#if defined(_MSC_VER) || defined(__x86_64__) || defined(__i386__) || defined(STRATA_X86_COMPAT)
 #include <immintrin.h>
 #define STRATA_SPIN_PAUSE() _mm_pause()
+#define STRATA_STORE_FENCE() _mm_sfence()
 #else
 #define STRATA_SPIN_PAUSE() ((void) 0)
+// No x86 store fence here.  The seq_cst atomic_thread_fence that precedes every use already
+// orders the pool's stores before the doorbell write on any target.
+#define STRATA_STORE_FENCE() ((void) 0)
 #endif
 
 namespace strata::core {
@@ -969,7 +974,7 @@ bool session_run_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, Se
         progress_at("token: the CPU experts of layer", l);
         if (pool != nullptr) pool(user, s.db->h_x_f, s.db->h_ids, s.db->h_weights, g.n_embd, s.k, y_miss_host);
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        _mm_sfence();
+        STRATA_STORE_FENCE();
         *flag = want;
         const auto t2 = Clock::now();
         tg.ms_wait += std::chrono::duration<double, std::milli>(t1 - t0).count();
